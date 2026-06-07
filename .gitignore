@@ -1,0 +1,24 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+*.tar
+*.jpg
+.idea
+.pth
+
+# Video data
+data/
+
+# Python virtual environment
+venv/
+.venv/
+
+checkpoints/
+
+thought/
+
+logmd/
