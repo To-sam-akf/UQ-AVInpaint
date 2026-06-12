@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 
 import numpy as np
 import torch
@@ -13,6 +14,22 @@ import Options_inpainting
 from Data_loaders import audio_loader as av_loader
 from Models.VIAI_AV_inpainting import VIAIAVModel
 from utils import util
+from utils.baseline_evaluation import (
+    aggregate_sample_records,
+    build_run_metadata,
+    compute_sample_records,
+    seed_everything,
+    select_prediction,
+    utc_now,
+    validate_record_coverage,
+    write_run_metadata,
+    write_standard_results,
+)
+from utils.baseline_protocol import (
+    load_mask_manifest,
+    resolve_mask_specs,
+    sha256_file,
+)
 from utils.viai_a_metrics import (
     compose_inpainted_mel,
     compute_viai_a_metrics,
@@ -34,6 +51,8 @@ RESULT_FIELDS = [
     "global_step",
     "global_epoch",
     "test_split_name",
+    "prediction_branch",
+    "mask_manifest_sha256",
     "stage",
     "use_gan",
     "enable_sync_loss",
@@ -84,7 +103,14 @@ def _arg_was_passed(name):
 
 def configure_viai_av_defaults():
     if not _arg_was_passed("--name"):
-        hparams.name = "VIAI-AV-PatchGAN" if getattr(hparams, "use_gan", False) else "VIAI-AV"
+        if getattr(hparams, "eval_branch", "av") == "probe":
+            hparams.name = "VIAI-AA-Prime"
+        else:
+            hparams.name = (
+                "VIAI-AV-PatchGAN"
+                if getattr(hparams, "use_gan", False)
+                else "VIAI-AV"
+            )
     if not _arg_was_passed("--results_dir"):
         hparams.results_dir = (
             "./checkpoints/viai_av_patchgan_test_results"
@@ -128,10 +154,11 @@ def format_step(step):
     return f"{step:09d}"
 
 
-def batch_metrics(model):
+def batch_metrics(model, branch="av"):
+    prediction = select_prediction(model, branch)
     mel_completed = compose_inpainted_mel(
         model.mel_input_4d,
-        model.mel_pred,
+        prediction,
         model.missing_mask,
     )
     metrics = compute_viai_a_metrics(
@@ -156,7 +183,15 @@ def mel_image_output_dir(results_dir, checkpoint_step_value):
     )
 
 
-def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None):
+def evaluate(
+    model,
+    data_loader,
+    global_step=0,
+    image_dir=None,
+    vocoder_dir=None,
+    mask_manifest=None,
+    prediction_branch="av",
+):
     totals = {
         "loss_total": 0.0,
         "loss_av_gen": 0.0,
@@ -184,6 +219,7 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
     vocoder_max_samples = getattr(hparams, "vocoder_max_samples", None)
     audio_embeddings = []
     video_embeddings = []
+    sample_records = []
 
     progress = tqdm(
         data_loader,
@@ -196,28 +232,50 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
             skipped_batches += 1
             progress.set_postfix(skipped_batches=skipped_batches)
             continue
-        model.get_blank_space_length(0)
-        model.set_inputs(data)
+        runtime_paths = data[-1]
+        mask_specs = None
+        if mask_manifest is not None:
+            mask_specs = resolve_mask_specs(
+                runtime_paths,
+                mask_manifest,
+                data_root=hparams.data_root,
+            )
+        else:
+            model.get_blank_space_length(0)
+        model.set_inputs(data, mask_specs=mask_specs)
         model.test(global_step=global_step)
         model.get_loss_items()
-        metrics = batch_metrics(model)
+        prediction = select_prediction(model, prediction_branch)
+        metrics = batch_metrics(model, branch=prediction_branch)
         batch_size = metrics["num_samples"]
 
-        totals["loss_total"] += model.loss_total_item
-        totals["loss_av_gen"] += model.loss_av_gen_item
-        totals["loss_recon"] += model.loss_recon_item
-        totals["loss_g_gan"] += model.loss_G_GAN_item
-        totals["loss_sync"] += model.loss_sync_item
-        totals["loss_probe_gen"] += model.loss_probe_gen_item
-        totals["loss_probe_recon"] += model.loss_probe_recon_item
-        totals["loss_probe_g_gan"] += model.loss_probe_G_GAN_item
-        totals["loss_d"] += model.loss_D_item
-        totals["eta1"] += model.eta1_item
-        totals["eta2"] += model.eta2_item
-        totals["full_l1"] += model.loss_full_l1_item
-        totals["missing_l1"] += model.loss_missing_l1_item
-        totals["probe_full_l1"] += model.loss_probe_full_l1_item
-        totals["probe_missing_l1"] += model.loss_probe_missing_l1_item
+        if prediction_branch == "probe":
+            selected_gen = model.loss_probe_gen_item
+            selected_recon = model.loss_probe_recon_item
+            selected_g_gan = model.loss_probe_G_GAN_item
+            selected_full_l1 = model.loss_probe_full_l1_item
+            selected_missing_l1 = model.loss_probe_missing_l1_item
+        else:
+            selected_gen = model.loss_av_gen_item
+            selected_recon = model.loss_recon_item
+            selected_g_gan = model.loss_G_GAN_item
+            selected_full_l1 = model.loss_full_l1_item
+            selected_missing_l1 = model.loss_missing_l1_item
+        totals["loss_total"] += model.loss_total_item * batch_size
+        totals["loss_av_gen"] += selected_gen * batch_size
+        totals["loss_recon"] += selected_recon * batch_size
+        totals["loss_g_gan"] += selected_g_gan * batch_size
+        totals["loss_sync"] += model.loss_sync_item * batch_size
+        totals["loss_probe_gen"] += model.loss_probe_gen_item * batch_size
+        totals["loss_probe_recon"] += model.loss_probe_recon_item * batch_size
+        totals["loss_probe_g_gan"] += model.loss_probe_G_GAN_item * batch_size
+        totals["loss_d"] += model.loss_D_item * batch_size
+        totals["eta1"] += model.eta1_item * batch_size
+        totals["eta2"] += model.eta2_item * batch_size
+        totals["full_l1"] += selected_full_l1 * batch_size
+        totals["missing_l1"] += selected_missing_l1 * batch_size
+        totals["probe_full_l1"] += model.loss_probe_full_l1_item * batch_size
+        totals["probe_missing_l1"] += model.loss_probe_missing_l1_item * batch_size
         totals["full_psnr"] += metrics["full_psnr"]
         totals["missing_psnr"] += metrics["missing_psnr"]
         totals["ssim"] += metrics["ssim"]
@@ -225,13 +283,26 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         video_embeddings.append(util.to_np(model.video_net_norm))
         sample_count += batch_size
         batch_count += 1
+        if mask_specs is not None:
+            sample_records.extend(
+                compute_sample_records(
+                    runtime_paths,
+                    mask_specs,
+                    "viai_av" if prediction_branch == "av" else "viai_aa_probe",
+                    model.mel_input_4d,
+                    prediction,
+                    model.mel_target_4d,
+                    model.missing_mask,
+                    data_root=hparams.data_root,
+                )
+            )
         if image_dir is not None:
             save_mel_comparison_batch(
                 image_dir,
                 sample_count - batch_size,
                 model.path_batch,
                 model.mel_input_4d,
-                model.mel_pred,
+                prediction,
                 model.mel_target_4d,
                 model.missing_mask,
             )
@@ -247,7 +318,7 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
                     sample_count - batch_size,
                     model.path_batch,
                     model.mel_input_4d,
-                    model.mel_pred,
+                    prediction,
                     model.missing_mask,
                     model.audio_target,
                     hparams,
@@ -273,22 +344,22 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
     video_embeddings = np.concatenate(video_embeddings, axis=0)
     audio_to_video = util.L2retrieval(video_embeddings, audio_embeddings)
     video_to_audio = util.L2retrieval(audio_embeddings, video_embeddings)
-    return {
-        "loss_total": totals["loss_total"] / batch_count,
-        "loss_av_gen": totals["loss_av_gen"] / batch_count,
-        "loss_recon": totals["loss_recon"] / batch_count,
-        "loss_g_gan": totals["loss_g_gan"] / batch_count,
-        "loss_sync": totals["loss_sync"] / batch_count,
-        "loss_probe_gen": totals["loss_probe_gen"] / batch_count,
-        "loss_probe_recon": totals["loss_probe_recon"] / batch_count,
-        "loss_probe_g_gan": totals["loss_probe_g_gan"] / batch_count,
-        "loss_d": totals["loss_d"] / batch_count,
-        "eta1": totals["eta1"] / batch_count,
-        "eta2": totals["eta2"] / batch_count,
-        "mel_l1_full": totals["full_l1"] / batch_count,
-        "mel_l1_missing": totals["missing_l1"] / batch_count,
-        "probe_l1_full": totals["probe_full_l1"] / batch_count,
-        "probe_l1_missing": totals["probe_missing_l1"] / batch_count,
+    results = {
+        "loss_total": totals["loss_total"] / sample_count,
+        "loss_av_gen": totals["loss_av_gen"] / sample_count,
+        "loss_recon": totals["loss_recon"] / sample_count,
+        "loss_g_gan": totals["loss_g_gan"] / sample_count,
+        "loss_sync": totals["loss_sync"] / sample_count,
+        "loss_probe_gen": totals["loss_probe_gen"] / sample_count,
+        "loss_probe_recon": totals["loss_probe_recon"] / sample_count,
+        "loss_probe_g_gan": totals["loss_probe_g_gan"] / sample_count,
+        "loss_d": totals["loss_d"] / sample_count,
+        "eta1": totals["eta1"] / sample_count,
+        "eta2": totals["eta2"] / sample_count,
+        "mel_l1_full": totals["full_l1"] / sample_count,
+        "mel_l1_missing": totals["missing_l1"] / sample_count,
+        "probe_l1_full": totals["probe_full_l1"] / sample_count,
+        "probe_l1_missing": totals["probe_missing_l1"] / sample_count,
         "psnr_full": totals["full_psnr"] / sample_count,
         "psnr_missing": totals["missing_psnr"] / sample_count,
         "ssim": totals["ssim"] / sample_count,
@@ -298,10 +369,22 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "skipped_batches": skipped_batches,
         "vocoder_output_dir": "" if vocoder_dir is None else vocoder_dir,
         "vocoder_num_samples": vocoder_count,
+        "sample_records": sample_records,
     }
+    if mask_manifest is not None:
+        validate_record_coverage(sample_records, mask_manifest)
+        results.update(aggregate_sample_records(sample_records))
+    return results
 
 
-def build_result_record(checkpoint_path, checkpoint_step_value, global_step, global_epoch, results):
+def build_result_record(
+    checkpoint_path,
+    checkpoint_step_value,
+    global_step,
+    global_epoch,
+    results,
+    model,
+):
     audio_to_video = results["retrieval_audio_to_video"]
     video_to_audio = results["retrieval_video_to_audio"]
     return {
@@ -310,7 +393,15 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "global_step": int(global_step),
         "global_epoch": int(global_epoch),
         "test_split_name": hparams.test_split_name,
-        "stage": "VIAI-AV-stage4-sync-probe",
+        "prediction_branch": (
+            "viai_av" if hparams.eval_branch == "av" else "viai_aa_probe"
+        ),
+        "mask_manifest_sha256": (
+            sha256_file(hparams.baseline_mask_manifest)
+            if getattr(hparams, "baseline_mask_manifest", None)
+            else ""
+        ),
+        "stage": getattr(model, "checkpoint_stage", "VIAI-AV-stage4-sync-probe"),
         "use_gan": bool(getattr(hparams, "use_gan", False)),
         "enable_sync_loss": not bool(getattr(hparams, "disable_sync_loss", False)),
         "enable_probe_loss": not bool(getattr(hparams, "disable_probe_loss", False)),
@@ -437,7 +528,15 @@ def write_result_files(record, results_dir, name):
 
 
 def main():
+    started_at = utc_now()
     configure_viai_av_defaults()
+    if getattr(hparams, "deterministic_eval", False) or getattr(
+        hparams, "baseline_mask_manifest", None
+    ):
+        seed_everything(hparams.eval_seed)
+    mask_manifest = None
+    if getattr(hparams, "baseline_mask_manifest", None):
+        mask_manifest = load_mask_manifest(hparams.baseline_mask_manifest)
     data_loaders = av_loader.get_data_loaders(
         hparams.data_root,
         hparams.speaker_id,
@@ -452,27 +551,42 @@ def main():
     model = VIAIAVModel(hparams, device=device)
     checkpoint_path = resolve_checkpoint_path(hparams.resume_path, hparams.checkpoint_dir, hparams.name)
     global_step, global_epoch = model.load_checkpoint(checkpoint_path, reset_optimizer=True)
+    if hparams.eval_branch == "probe" and not getattr(
+        model, "checkpoint_enable_probe_loss", False
+    ):
+        raise RuntimeError(
+            "The selected VIAI-AV checkpoint was not saved with probe loss enabled; "
+            "it cannot be frozen as the VIAI-AA' reference."
+        )
     print(f"[VIAI-AV test] loaded checkpoint: {checkpoint_path} (step={global_step}, epoch={global_epoch})")
 
     checkpoint_step_value = checkpoint_step(checkpoint_path)
     if checkpoint_step_value < 0:
         checkpoint_step_value = global_step
-    image_dir = mel_image_output_dir(hparams.results_dir, checkpoint_step_value)
+    if mask_manifest is None:
+        image_dir = mel_image_output_dir(hparams.results_dir, checkpoint_step_value)
+    else:
+        image_dir = os.path.join(hparams.results_dir, "mel-image")
     vocoder_dir = None
     if getattr(hparams, "use_vocoder", False):
         vocoder_dir = hparams.vocoder_output_dir
         if not vocoder_dir:
-            vocoder_dir = os.path.join(
-                hparams.results_dir,
-                "wav",
-                f"step{format_step(checkpoint_step_value)}",
-            )
+            if mask_manifest is None:
+                vocoder_dir = os.path.join(
+                    hparams.results_dir,
+                    "wav",
+                    f"step{format_step(checkpoint_step_value)}",
+                )
+            else:
+                vocoder_dir = os.path.join(hparams.results_dir, "wav")
     results = evaluate(
         model,
         data_loaders["test"],
         global_step=checkpoint_step_value,
         image_dir=image_dir,
         vocoder_dir=vocoder_dir,
+        mask_manifest=mask_manifest,
+        prediction_branch=hparams.eval_branch,
     )
     result_record = build_result_record(
         checkpoint_path,
@@ -480,12 +594,39 @@ def main():
         global_step,
         global_epoch,
         results,
+        model,
     )
     json_path, csv_path = write_result_files(
         result_record,
         hparams.results_dir,
         hparams.name,
     )
+    if mask_manifest is not None:
+        standard_summary = dict(result_record)
+        standard_summary["known_region_max_abs_error"] = float(
+            results["known_region_max_abs_error"]
+        )
+        summary_path, samples_path, metrics_path = write_standard_results(
+            hparams.results_dir,
+            results["sample_records"],
+            standard_summary,
+        )
+        metadata = build_run_metadata(
+            checkpoint_path,
+            vars(hparams),
+            sys.argv,
+            hparams.eval_seed,
+            started_at,
+            Path(__file__).resolve().parent,
+            mask_manifest_path=hparams.baseline_mask_manifest,
+            protocol_path=getattr(hparams, "baseline_protocol_json", None),
+            prediction_branch=result_record["prediction_branch"],
+        )
+        metadata_path = write_run_metadata(hparams.results_dir, metadata)
+        print(f"[VIAI-AV test] wrote baseline summary: {summary_path}")
+        print(f"[VIAI-AV test] wrote per-sample JSONL: {samples_path}")
+        print(f"[VIAI-AV test] wrote per-sample CSV: {metrics_path}")
+        print(f"[VIAI-AV test] wrote run metadata: {metadata_path}")
     print(
         "[VIAI-AV test] "
         f"samples={results['num_samples']} "

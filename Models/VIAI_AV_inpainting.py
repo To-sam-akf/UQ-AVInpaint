@@ -140,7 +140,7 @@ class VIAIAVModel(object):
         self.blank_length = random.randint(min_blank, max_blank)
         return self.blank_length
 
-    def set_inputs(self, data):
+    def set_inputs(self, data, mask_specs=None):
         if len(data) < 8:
             raise ValueError("Expected 8-tuple batch from audio_loader.collate_fn")
         (
@@ -164,10 +164,21 @@ class VIAIAVModel(object):
 
         if self.mel_target is None:
             raise ValueError("Local conditioning Mel target is required for VIAI-AV training")
-        self.mel_input, self.missing_mask, self.missing_span = mel_loader.corrupt_mel_spectrogram(
-            self.mel_target,
-            self.blank_length,
-        )
+        if mask_specs is None:
+            self.mel_input, self.missing_mask, self.missing_span = (
+                mel_loader.corrupt_mel_spectrogram(
+                    self.mel_target,
+                    self.blank_length,
+                )
+            )
+        else:
+            self.mel_input, self.missing_mask, self.missing_span = (
+                mel_loader.corrupt_mel_spectrogram_batch(
+                    self.mel_target,
+                    mask_specs,
+                )
+            )
+            self.blank_length = int(mask_specs[0]["gap_frames"])
         self.mel_target_4d = self.mel_target.unsqueeze(1)
         self.mel_input_4d = self.mel_input.unsqueeze(1)
         self.missing_mask = self.missing_mask.to(self.device)
@@ -437,6 +448,10 @@ class VIAIAVModel(object):
     # 导入共有的结构权重，主要是Mel_Encoder和Mel_Decoder的权重，VideoEncoder不导入，因为VIAI-A没有视频编码器；如果有netD且当前模型使用GAN，则导入netD权重，否则不导入netD权重
     def load_checkpoint(self, checkpoint_path, reset_optimizer=False):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
+        self.checkpoint_stage = checkpoint.get("stage", "")
+        self.checkpoint_enable_probe_loss = bool(
+            checkpoint.get("enable_probe_loss", False)
+        )
         self._assert_checkpoint_gan_mode(checkpoint, checkpoint_path)
         self.Mel_Encoder.load_state_dict(checkpoint["Mel_Encoder"])
         self.Mel_Decoder.load_state_dict(checkpoint["Mel_Decoder"])

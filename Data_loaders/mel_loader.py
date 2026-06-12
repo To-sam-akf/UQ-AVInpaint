@@ -76,3 +76,53 @@ def corrupt_mel_spectrogram(
         return mel_4d.squeeze(1), mask, (start, end)
     return mel_4d, mask, (start, end)
 
+
+def corrupt_mel_spectrogram_batch(mel_batch, mask_specs, min_margin=3):
+    """Corrupt each sample with its own fixed missing span."""
+    if mel_batch.dim() == 3:
+        mel_4d = mel_batch.unsqueeze(1).clone()
+        squeeze_channel = True
+    elif mel_batch.dim() == 4:
+        mel_4d = mel_batch.clone()
+        squeeze_channel = False
+    else:
+        raise ValueError("mel_batch must be a 3D or 4D tensor")
+    if len(mask_specs) != mel_4d.size(0):
+        raise ValueError(
+            f"Expected {mel_4d.size(0)} mask specs, got {len(mask_specs)}"
+        )
+
+    batch_size, _, mel_bins, mel_steps = mel_4d.shape
+    mask = torch.zeros(
+        batch_size,
+        1,
+        mel_bins,
+        mel_steps,
+        device=mel_4d.device,
+        dtype=mel_4d.dtype,
+    )
+    spans = []
+    for index, spec in enumerate(mask_specs):
+        start = int(spec["start"])
+        end = int(spec["end"])
+        gap_frames = int(spec.get("gap_frames", end - start))
+        if end - start != gap_frames:
+            raise ValueError(
+                f"Mask spec {index} has inconsistent span/gap: "
+                f"start={start} end={end} gap_frames={gap_frames}"
+            )
+        if start < min_margin or end > mel_steps - min_margin or end <= start:
+            raise ValueError(
+                f"Mask spec {index} is outside the valid Mel range: {start}:{end}"
+            )
+        mask[index, :, :, start:end] = 1.0
+        mel_4d[index : index + 1] = interpolate_missing_region(
+            mel_4d[index : index + 1],
+            start,
+            gap_frames,
+        )
+        spans.append((start, end))
+
+    if squeeze_channel:
+        return mel_4d.squeeze(1), mask, spans
+    return mel_4d, mask, spans

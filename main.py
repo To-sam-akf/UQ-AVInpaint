@@ -14,6 +14,8 @@ MODULE_MAP = {
     "test-viai-a": "test_viai_a",
     "train-viai-av": "train_viai_av",
     "test-viai-av": "test_viai_av",
+    "freeze-viai-baselines": "tools.freeze_viai_baselines",
+    "prepare-uq-metadata": "tools.prepare_uq_metadata",
 }
 
 

@@ -161,6 +161,41 @@ class BaseOptions(object):
         self.parser.add_argument("--max_time_steps", type=int, default=64000)
         self.parser.add_argument("--min_blank_frames", type=int, default=20)
         self.parser.add_argument("--max_blank_frames", type=int, default=50)
+        self.parser.add_argument(
+            "--baseline-mask-manifest",
+            "--baseline_mask_manifest",
+            dest="baseline_mask_manifest",
+            type=str,
+            default=None,
+            help="Optional fixed per-sample mask manifest for reproducible baseline evaluation.",
+        )
+        self.parser.add_argument(
+            "--baseline-protocol-json",
+            "--baseline_protocol_json",
+            dest="baseline_protocol_json",
+            type=str,
+            default=None,
+        )
+        self.parser.add_argument(
+            "--eval-seed",
+            "--eval_seed",
+            dest="eval_seed",
+            type=int,
+            default=1234,
+        )
+        self.parser.add_argument(
+            "--deterministic-eval",
+            "--deterministic_eval",
+            dest="deterministic_eval",
+            action="store_true",
+        )
+        self.parser.add_argument(
+            "--eval-branch",
+            "--eval_branch",
+            dest="eval_branch",
+            choices=["av", "probe"],
+            default="av",
+        )
 
         # Mel / audio features
         self.parser.add_argument("--sample_rate", type=int, default=16000)

@@ -3,6 +3,7 @@ import json
 import os
 import re
 import sys
+from pathlib import Path
 
 import torch
 import torch.backends.cudnn as cudnn
@@ -11,6 +12,21 @@ from tqdm import tqdm
 import Options_inpainting
 from Data_loaders import viai_a_loader
 from Models.VIAI_A_inpainting import VIAIAModel
+from utils.baseline_evaluation import (
+    aggregate_sample_records,
+    build_run_metadata,
+    compute_sample_records,
+    seed_everything,
+    utc_now,
+    validate_record_coverage,
+    write_run_metadata,
+    write_standard_results,
+)
+from utils.baseline_protocol import (
+    load_mask_manifest,
+    resolve_mask_specs,
+    sha256_file,
+)
 from utils.viai_a_metrics import (
     compose_inpainted_mel,
     compute_viai_a_metrics,
@@ -32,6 +48,8 @@ RESULT_FIELDS = [
     "global_step",
     "global_epoch",
     "test_split_name",
+    "prediction_branch",
+    "mask_manifest_sha256",
     "use_gan",
     "num_samples",
     "loss_total",
@@ -114,6 +132,12 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "global_step": int(global_step),
         "global_epoch": int(global_epoch),
         "test_split_name": hparams.test_split_name,
+        "prediction_branch": "viai_a",
+        "mask_manifest_sha256": (
+            sha256_file(hparams.baseline_mask_manifest)
+            if getattr(hparams, "baseline_mask_manifest", None)
+            else ""
+        ),
         "use_gan": bool(getattr(hparams, "use_gan", False)),
         "num_samples": int(results["num_samples"]),
         "loss_total": float(results["loss_total"]),
@@ -239,7 +263,14 @@ def batch_metrics(model):
     }
 
 
-def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None):
+def evaluate(
+    model,
+    data_loader,
+    global_step=0,
+    image_dir=None,
+    vocoder_dir=None,
+    mask_manifest=None,
+):
     totals = {
         "loss_total": 0.0,
         "loss_recon": 0.0,
@@ -260,6 +291,7 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
     batch_count = 0
     vocoder_count = 0
     vocoder_max_samples = getattr(hparams, "vocoder_max_samples", None)
+    sample_records = []
 
     progress = tqdm(
         data_loader,
@@ -268,28 +300,52 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         dynamic_ncols=True,
     )
     for data in progress:
-        model.set_inputs(data, deterministic_missing=True)
+        mask_specs = None
+        if mask_manifest is not None:
+            mask_specs = resolve_mask_specs(
+                data["path"],
+                mask_manifest,
+                data_root=hparams.data_root,
+            )
+        model.set_inputs(
+            data,
+            deterministic_missing=mask_manifest is None,
+            mask_specs=mask_specs,
+        )
         model.test(global_step=global_step)
         model.get_loss_items()
         metrics = batch_metrics(model)
         batch_size = metrics["num_samples"]
 
-        totals["loss_total"] += model.loss_total_item
-        totals["loss_recon"] += model.loss_recon_item
-        totals["loss_g_gan"] += model.loss_G_GAN_item
-        totals["loss_d"] += model.loss_D_item
-        totals["loss_d_real"] += model.loss_D_real_item
-        totals["loss_d_fake"] += model.loss_D_fake_item
-        totals["d_real_mean"] += model.d_real_mean_item
-        totals["d_fake_mean"] += model.d_fake_mean_item
-        totals["eta1"] += model.eta1_item
-        totals["full_l1"] += model.loss_full_l1_item
-        totals["missing_l1"] += model.loss_missing_l1_item
+        totals["loss_total"] += model.loss_total_item * batch_size
+        totals["loss_recon"] += model.loss_recon_item * batch_size
+        totals["loss_g_gan"] += model.loss_G_GAN_item * batch_size
+        totals["loss_d"] += model.loss_D_item * batch_size
+        totals["loss_d_real"] += model.loss_D_real_item * batch_size
+        totals["loss_d_fake"] += model.loss_D_fake_item * batch_size
+        totals["d_real_mean"] += model.d_real_mean_item * batch_size
+        totals["d_fake_mean"] += model.d_fake_mean_item * batch_size
+        totals["eta1"] += model.eta1_item * batch_size
+        totals["full_l1"] += model.loss_full_l1_item * batch_size
+        totals["missing_l1"] += model.loss_missing_l1_item * batch_size
         totals["full_psnr"] += metrics["full_psnr"]
         totals["missing_psnr"] += metrics["missing_psnr"]
         totals["ssim"] += metrics["ssim"]
         sample_count += batch_size
         batch_count += 1
+        if mask_specs is not None:
+            sample_records.extend(
+                compute_sample_records(
+                    data["path"],
+                    mask_specs,
+                    "viai_a",
+                    model.mel_input_4d,
+                    model.mel_pred,
+                    model.mel_target_4d,
+                    model.missing_mask,
+                    data_root=hparams.data_root,
+                )
+            )
         if image_dir is not None:
             save_mel_comparison_batch(
                 image_dir,
@@ -338,29 +394,42 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
     if batch_count == 0:
         raise RuntimeError("VIAI-A test dataloader is empty.")
 
-    return {
-        "loss_total": totals["loss_total"] / batch_count,
-        "loss_recon": totals["loss_recon"] / batch_count,
-        "loss_g_gan": totals["loss_g_gan"] / batch_count,
-        "loss_d": totals["loss_d"] / batch_count,
-        "loss_d_real": totals["loss_d_real"] / batch_count,
-        "loss_d_fake": totals["loss_d_fake"] / batch_count,
-        "d_real_mean": totals["d_real_mean"] / batch_count,
-        "d_fake_mean": totals["d_fake_mean"] / batch_count,
-        "eta1": totals["eta1"] / batch_count,
-        "mel_l1_full": totals["full_l1"] / batch_count,
-        "mel_l1_missing": totals["missing_l1"] / batch_count,
+    results = {
+        "loss_total": totals["loss_total"] / sample_count,
+        "loss_recon": totals["loss_recon"] / sample_count,
+        "loss_g_gan": totals["loss_g_gan"] / sample_count,
+        "loss_d": totals["loss_d"] / sample_count,
+        "loss_d_real": totals["loss_d_real"] / sample_count,
+        "loss_d_fake": totals["loss_d_fake"] / sample_count,
+        "d_real_mean": totals["d_real_mean"] / sample_count,
+        "d_fake_mean": totals["d_fake_mean"] / sample_count,
+        "eta1": totals["eta1"] / sample_count,
+        "mel_l1_full": totals["full_l1"] / sample_count,
+        "mel_l1_missing": totals["missing_l1"] / sample_count,
         "psnr_full": totals["full_psnr"] / sample_count,
         "psnr_missing": totals["missing_psnr"] / sample_count,
         "ssim": totals["ssim"] / sample_count,
         "num_samples": sample_count,
         "vocoder_output_dir": "" if vocoder_dir is None else vocoder_dir,
         "vocoder_num_samples": vocoder_count,
+        "sample_records": sample_records,
     }
+    if mask_manifest is not None:
+        validate_record_coverage(sample_records, mask_manifest)
+        results.update(aggregate_sample_records(sample_records))
+    return results
 
 
 def main():
+    started_at = utc_now()
     configure_viai_a_defaults()
+    if getattr(hparams, "deterministic_eval", False) or getattr(
+        hparams, "baseline_mask_manifest", None
+    ):
+        seed_everything(hparams.eval_seed)
+    mask_manifest = None
+    if getattr(hparams, "baseline_mask_manifest", None):
+        mask_manifest = load_mask_manifest(hparams.baseline_mask_manifest)
     data_loaders = viai_a_loader.get_data_loaders(hparams.data_root, phases=("test",))
     if "test" not in data_loaders:
         raise RuntimeError(
@@ -375,22 +444,29 @@ def main():
     checkpoint_step_value = checkpoint_step(checkpoint_path)
     if checkpoint_step_value < 0:
         checkpoint_step_value = global_step
-    image_dir = mel_image_output_dir(hparams.results_dir, checkpoint_step_value)
+    if mask_manifest is None:
+        image_dir = mel_image_output_dir(hparams.results_dir, checkpoint_step_value)
+    else:
+        image_dir = os.path.join(hparams.results_dir, "mel-image")
     vocoder_dir = None
     if getattr(hparams, "use_vocoder", False):
         vocoder_dir = hparams.vocoder_output_dir
         if not vocoder_dir:
-            vocoder_dir = os.path.join(
-                hparams.results_dir,
-                "wav",
-                f"step{format_step(checkpoint_step_value)}",
-            )
+            if mask_manifest is None:
+                vocoder_dir = os.path.join(
+                    hparams.results_dir,
+                    "wav",
+                    f"step{format_step(checkpoint_step_value)}",
+                )
+            else:
+                vocoder_dir = os.path.join(hparams.results_dir, "wav")
     results = evaluate(
         model,
         data_loaders["test"],
         global_step=checkpoint_step_value,
         image_dir=image_dir,
         vocoder_dir=vocoder_dir,
+        mask_manifest=mask_manifest,
     )
     result_record = build_result_record(
         checkpoint_path,
@@ -404,6 +480,32 @@ def main():
         hparams.results_dir,
         hparams.name,
     )
+    if mask_manifest is not None:
+        standard_summary = dict(result_record)
+        standard_summary["known_region_max_abs_error"] = float(
+            results["known_region_max_abs_error"]
+        )
+        summary_path, samples_path, metrics_path = write_standard_results(
+            hparams.results_dir,
+            results["sample_records"],
+            standard_summary,
+        )
+        metadata = build_run_metadata(
+            checkpoint_path,
+            vars(hparams),
+            sys.argv,
+            hparams.eval_seed,
+            started_at,
+            Path(__file__).resolve().parent,
+            mask_manifest_path=hparams.baseline_mask_manifest,
+            protocol_path=getattr(hparams, "baseline_protocol_json", None),
+            prediction_branch="viai_a",
+        )
+        metadata_path = write_run_metadata(hparams.results_dir, metadata)
+        print(f"[VIAI-A test] wrote baseline summary: {summary_path}")
+        print(f"[VIAI-A test] wrote per-sample JSONL: {samples_path}")
+        print(f"[VIAI-A test] wrote per-sample CSV: {metrics_path}")
+        print(f"[VIAI-A test] wrote run metadata: {metadata_path}")
     print(
         "[VIAI-A test] "
         f"samples={results['num_samples']} "

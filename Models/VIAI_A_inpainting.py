@@ -78,9 +78,21 @@ class VIAIAModel(object):
         start = max(min_margin, min(center_start, max_start))
         return blank_length, start
 
-    def set_inputs(self, data, deterministic_missing=False):
+    def set_inputs(self, data, deterministic_missing=False, mask_specs=None):
         self.mel_target = data["mel"].float().to(self.device)
         self.path_batch = data["path"]
+        if mask_specs is not None:
+            self.mel_input, self.missing_mask, self.missing_span = (
+                mel_loader.corrupt_mel_spectrogram_batch(
+                    self.mel_target,
+                    mask_specs,
+                )
+            )
+            self.blank_length = int(mask_specs[0]["gap_frames"])
+            self.mel_target_4d = self.mel_target.unsqueeze(1)
+            self.mel_input_4d = self.mel_input.unsqueeze(1)
+            self.missing_mask = self.missing_mask.to(self.device)
+            return
         start = None
         blank_length = self.blank_length
         if deterministic_missing:
