@@ -530,3 +530,26 @@ The use of this software is RESTRICTED to **non-commercial research and educatio
 ## Acknowledgement
 
 The structure of this codebase is borrowed from [pix2pix](https://github.com/junyanz/pytorch-CycleGAN-and-pix2pix) and [wavenet_vocoder](https://github.com/r9y9/wavenet_vocoder).
+
+
+## 8. 上传到云端
+```
+rsync -avz --progress \
+  --exclude='.git/' \
+  --exclude='.venv/' \
+  --exclude='data/' \
+  --exclude='checkpoints/' \
+  --exclude='__pycache__/' \
+  --exclude='*.pyc' \
+  --exclude='*.pth.tar' \
+  --exclude='*.Zone.Identifier' \
+  --exclude='.agents/' \
+  --exclude='.codex' \
+  --exclude='.python-version' \
+  --exclude='NUL' \
+  --exclude='uv.lock' \
+  --exclude='VIAI.pdf' \
+  -e "ssh -p 2233" \
+  ~/VIAIpro/ \
+  root@ackcs-00gjgrzt@ssh.bj8.bz1.paratera.com:/root/Vision-Infused-Audio-Inpainter-VIAI/
+```

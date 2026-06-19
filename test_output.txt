@@ -1,0 +1,23 @@
+============================= test session starts ==============================
+platform linux -- Python 3.8.10, pytest-7.2.0, pluggy-1.0.0
+rootdir: /root/Vision-Infused-Audio-Inpainter-VIAI
+plugins: hypothesis-5.35.1, shard-0.1.2, xdoctest-1.0.2, xdist-3.0.2, rerunfailures-10.2
+collected 19 items / 1 error
+Running 19 items in this shard
+
+==================================== ERRORS ====================================
+__________________ ERROR collecting tests/test_uq_av_data.py ___________________
+ImportError while importing test module '/root/Vision-Infused-Audio-Inpainter-VIAI/tests/test_uq_av_data.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.8/importlib/__init__.py:127: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+tests/test_uq_av_data.py:5: in <module>
+    import cv2
+/usr/local/lib/python3.8/dist-packages/cv2/__init__.py:8: in <module>
+    from .cv2 import *
+E   ModuleNotFoundError: No module named 'cv2.cv2'
+=========================== short test summary info ============================
+ERROR tests/test_uq_av_data.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+=============================== 1 error in 1.13s ===============================

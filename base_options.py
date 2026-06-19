@@ -282,6 +282,151 @@ class BaseOptions(object):
         self.parser.add_argument("--file_channel", type=int, default=-1)
         self.parser.add_argument("--log_scale_min", type=float, default=-7.0)
 
+        # -------------------------------------------------------------------
+        # UQ-AVInpaint (P3-P6) — Mel autoencoder, latent diffusion, multi-hypothesis
+        # -------------------------------------------------------------------
+        self.parser.add_argument(
+            "--ae_checkpoint",
+            type=str,
+            default=None,
+            help="Path to a pre-trained Mel AE checkpoint (required for P3+).",
+        )
+        self.parser.add_argument(
+            "--ae_latent_dim",
+            type=int,
+            default=8,
+            help="Mel AE latent channel dimension (used when building the AE/UNet).",
+        )
+        self.parser.add_argument(
+            "--ae_base_channels",
+            type=int,
+            default=32,
+            help="Base channel count for Mel AE encoder/decoder.",
+        )
+        self.parser.add_argument(
+            "--ae_warmup_steps",
+            type=int,
+            default=2000,
+            help="Mel AE warmup steps with L1-only loss before enabling gradient/boundary terms.",
+        )
+        self.parser.add_argument(
+            "--uq_no_video",
+            action="store_true",
+            help="Run in audio-only mode (use VideoConditionDummy).",
+        )
+        self.parser.add_argument(
+            "--uq_video_dim",
+            type=int,
+            default=256,
+            help="Video token dimension for cross-attention in the diffusion U-Net.",
+        )
+        self.parser.add_argument(
+            "--uq_unet_base_channels",
+            type=int,
+            default=64,
+            help="Base channel count for the latent diffusion U-Net.",
+        )
+        self.parser.add_argument(
+            "--uq_time_emb_dim",
+            type=int,
+            default=256,
+            help="Dimension of the sinusoidal time embedding in the diffusion U-Net.",
+        )
+        self.parser.add_argument(
+            "--uq_attn_heads",
+            type=int,
+            default=4,
+            help="Number of attention heads for cross-attention over video tokens.",
+        )
+        self.parser.add_argument(
+            "--uq_lambda_boundary",
+            type=float,
+            default=0.1,
+            help="Weight of the boundary-consistency auxiliary loss.",
+        )
+        self.parser.add_argument(
+            "--uq_lambda_sync",
+            type=float,
+            default=0.0,
+            help="Weight of the audio-visual sync auxiliary loss (P5+).",
+        )
+        self.parser.add_argument(
+            "--uq_lr",
+            type=float,
+            default=None,
+            help="Learning rate for UQ diffusion training (falls back to --lr).",
+        )
+        self.parser.add_argument(
+            "--uq_grad_clip",
+            type=float,
+            default=1.0,
+            help="Max gradient norm for diffusion U-Net training.",
+        )
+        self.parser.add_argument(
+            "--uq_inference_steps",
+            type=int,
+            default=50,
+            help="Number of DDIM steps during inference.",
+        )
+        self.parser.add_argument(
+            "--uq_diffusion_timesteps",
+            type=int,
+            default=1000,
+            help="Total diffusion timesteps (training schedule length).",
+        )
+        self.parser.add_argument(
+            "--uq_num_candidates",
+            type=int,
+            default=1,
+            help="Number of inpainting candidates K (P4: 4/8/16).",
+        )
+        self.parser.add_argument(
+            "--uq_ddim_eta",
+            type=float,
+            default=0.0,
+            help="DDIM stochasticity parameter (0 = deterministic).",
+        )
+        self.parser.add_argument(
+            "--uq_beta_schedule",
+            type=str,
+            choices=["linear", "cosine"],
+            default="linear",
+            help="Diffusion noise schedule type.",
+        )
+        self.parser.add_argument(
+            "--uq_schedule_type",
+            type=str,
+            choices=["linear", "cosine"],
+            default="linear",
+            help="Alias for --uq_beta_schedule.",
+        )
+        self.parser.add_argument(
+            "--uq_lambda_diversity",
+            type=float,
+            default=0.0,
+            help="Diversity-target loss weight (P5+).",
+        )
+        self.parser.add_argument(
+            "--uq_video_degradation",
+            type=str,
+            default="original",
+            choices=["original", "blur", "occlusion", "frame_drop",
+                     "temporal_shift", "wrong_video", "no_video"],
+            help="Visual degradation condition for evaluation.",
+        )
+        self.parser.add_argument(
+            "--aq_audio_branch_channels",
+            type=int,
+            default=256,
+            help="Base channels for the internal audio-condition encoder.",
+        )
+        self.parser.add_argument(
+            "--test_image_batch_interval",
+            type=int,
+            default=10,
+            help="Write Mel comparison images every N validation/test batches.",
+        )
+
         self.initialized = True
         return self.parser
 

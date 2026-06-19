@@ -16,6 +16,10 @@ MODULE_MAP = {
     "test-viai-av": "test_viai_av",
     "freeze-viai-baselines": "tools.freeze_viai_baselines",
     "prepare-uq-metadata": "tools.prepare_uq_metadata",
+    "train-mel-ae": "train_mel_autoencoder",
+    "test-mel-ae": "test_mel_autoencoder",
+    "train-uq-av": "train_uq_av",
+    "test-uq-av": "test_uq_av",
 }
 
 
