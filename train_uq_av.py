@@ -69,6 +69,24 @@ def _configure_defaults():
         )
 
 
+def _uq_dataset_kwargs():
+    kwargs = {
+        "video_conditions": (getattr(hparams, "uq_video_degradation", "original"),),
+        "image_size": getattr(hparams, "image_size", 256),
+        "seed": getattr(hparams, "eval_seed", 1234),
+    }
+    metadata_dir = getattr(hparams, "uq_metadata_dir", None)
+    if metadata_dir:
+        kwargs["metadata_dir"] = metadata_dir
+    return kwargs
+
+
+def _set_loader_epoch(data_loader, epoch):
+    dataset = getattr(data_loader, "dataset", None)
+    if hasattr(dataset, "set_epoch"):
+        dataset.set_epoch(epoch)
+
+
 def _run_phase(model, data_loader, phase, global_step, writer,
                global_epoch):
     train = phase == "train"
@@ -225,6 +243,7 @@ def train_loop(model, data_loaders, writer, start_step=0, start_epoch=0):
     global_epoch = start_epoch
     while global_epoch < hparams.nepochs:
         if "train" in data_loaders:
+            _set_loader_epoch(data_loaders["train"], global_epoch)
             global_step, stop, _ = _run_phase(
                 model, data_loaders["train"], "train",
                 global_step, writer, global_epoch,
@@ -255,6 +274,9 @@ def train_loop(model, data_loaders, writer, start_step=0, start_epoch=0):
 def main():
     _configure_defaults()
 
+    if int(getattr(hparams, "uq_num_candidates", 1)) != 1:
+        raise ValueError("P3 train-uq-av only supports --uq_num_candidates 1.")
+
     split_names = {
         "train": hparams.train_split_name,
         "val": hparams.val_split_name,
@@ -278,6 +300,7 @@ def main():
         batch_size=hparams.batch_size,
         num_workers=getattr(hparams, "num_workers", 4),
         pin_memory=getattr(hparams, "pin_memory", True),
+        **_uq_dataset_kwargs(),
     )
 
     model = UQAVDiffusionModel(hparams, device=device)

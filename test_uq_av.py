@@ -23,15 +23,18 @@ import time
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 import Options_inpainting
 from Data_loaders.uq_av_loader import get_uq_av_data_loaders
 from Models.UQ_AV_Diffusion import UQAVDiffusionModel
+from networks.uq.mel_autoencoder import time_gradient
 from utils.viai_a_metrics import (
     compute_viai_a_metrics,
     compose_inpainted_mel,
     save_mel_comparison_batch,
+    structural_similarity_2d,
 )
 
 # ---------------------------------------------------------------------------
@@ -58,6 +61,67 @@ def _configure_defaults():
             getattr(hparams, "checkpoints_dir", "./checkpoints"),
             "uq_av_k1_test_results",
         )
+
+
+def _uq_dataset_kwargs():
+    kwargs = {
+        "video_conditions": (getattr(hparams, "uq_video_degradation", "original"),),
+        "image_size": getattr(hparams, "image_size", 256),
+        "seed": getattr(hparams, "eval_seed", 1234),
+    }
+    metadata_dir = getattr(hparams, "uq_metadata_dir", None)
+    if metadata_dir:
+        kwargs["metadata_dir"] = metadata_dir
+    return kwargs
+
+
+def _per_sample_metrics(mel_completed, mel_target, missing_mask, mel_corrupted):
+    pred = torch.clamp(mel_completed.detach(), 0.0, 1.0)
+    target = torch.clamp(mel_target.detach(), 0.0, 1.0)
+    mask = missing_mask.detach().to(device=pred.device, dtype=pred.dtype)
+    known_mask = 1.0 - mask
+
+    abs_diff = torch.abs(pred - target)
+    sq_diff = (pred - target) ** 2
+    full_l1 = abs_diff.mean(dim=(1, 2, 3))
+    full_mse = sq_diff.mean(dim=(1, 2, 3))
+
+    missing_count = mask.sum(dim=(1, 2, 3)).clamp(min=1.0)
+    missing_l1 = (abs_diff * mask).sum(dim=(1, 2, 3)) / missing_count
+    missing_mse = (sq_diff * mask).sum(dim=(1, 2, 3)) / missing_count
+    psnr_full = -10.0 * torch.log10(full_mse.clamp(min=1e-12))
+    psnr_missing = -10.0 * torch.log10(missing_mse.clamp(min=1e-12))
+
+    known_error = (
+        torch.abs(pred - mel_corrupted.detach()) * known_mask
+    ).flatten(1).max(dim=1).values
+
+    grad_pred = time_gradient(pred)
+    grad_target = time_gradient(target)
+    weight = F.max_pool2d(mask[:, :1], kernel_size=(1, 5),
+                          stride=1, padding=(0, 2))
+    weight = weight[:, :, :, :grad_pred.size(-1)].clamp(0, 1)
+    boundary_count = weight.sum(dim=(1, 2, 3)).clamp(min=1.0)
+    boundary_l1 = (
+        torch.abs(grad_pred - grad_target) * weight
+    ).sum(dim=(1, 2, 3)) / boundary_count
+
+    pred_np = pred.squeeze(1).cpu().numpy()
+    target_np = target.squeeze(1).cpu().numpy()
+    ssim = [
+        structural_similarity_2d(pred_np[index], target_np[index])
+        for index in range(pred.size(0))
+    ]
+
+    return {
+        "mel_l1_full": full_l1.cpu().tolist(),
+        "mel_l1_missing": missing_l1.cpu().tolist(),
+        "psnr_full_db": psnr_full.cpu().tolist(),
+        "psnr_missing_db": psnr_missing.cpu().tolist(),
+        "boundary_l1": boundary_l1.cpu().tolist(),
+        "known_region_max_abs_error": known_error.cpu().tolist(),
+        "ssim_full": ssim,
+    }
 
 
 def _vocoder_export(mel_completed, mel_target, sample_ids,
@@ -109,6 +173,10 @@ def _vocoder_export(mel_completed, mel_target, sample_ids,
 def main():
     _configure_defaults()
 
+    num_candidates = int(getattr(hparams, "uq_num_candidates", 1))
+    if num_candidates != 1:
+        raise ValueError("P3 test-uq-av only supports --uq_num_candidates 1.")
+
     ae_ckpt = getattr(hparams, "ae_checkpoint", None)
     if ae_ckpt is None:
         raise RuntimeError(
@@ -128,6 +196,7 @@ def main():
         num_workers=getattr(hparams, "num_workers", 4),
         pin_memory=getattr(hparams, "pin_memory", True),
         shuffle=False,
+        **_uq_dataset_kwargs(),
     )
     data_loader = data_loaders["test"]
 
@@ -148,6 +217,7 @@ def main():
     inference_steps = int(
         getattr(hparams, "uq_inference_steps", 50)
     )
+    ddim_eta = float(getattr(hparams, "uq_ddim_eta", 0.0))
 
     # Metrics accumulators
     all_records = []
@@ -155,6 +225,7 @@ def main():
         "psnr_full_sum": 0.0, "psnr_missing_sum": 0.0,
         "ssim_full_sum": 0.0, "mel_l1_full_sum": 0.0,
         "mel_l1_missing_sum": 0.0, "known_max_abs_err_sum": 0.0,
+        "known_max_abs_err_max": 0.0, "boundary_l1_sum": 0.0,
     }
     sample_count = 0
     ssim_sample_count = 0
@@ -164,27 +235,37 @@ def main():
     for batch_idx, batch in enumerate(progress):
         # K=1 DDIM inference
         result = model.sample(
-            batch, num_candidates=1,
+            batch, num_candidates=num_candidates,
             inference_steps=inference_steps,
-            ddim_eta=0.0,
+            ddim_eta=ddim_eta,
         )
 
         mel_completed = result["completed_mels"][:, 0]  # [B, 1, 80, 200]
         mel_pred = result["candidate_mels"][:, 0]
-
-        # Verify known-region preservation
-        known_mask = 1.0 - model.missing_mask
-        known_error = (
-            torch.abs(mel_completed - model.mel_corrupted) * known_mask
-        ).max()
 
         # Compute metrics
         metrics = compute_viai_a_metrics(
             mel_completed, model.mel_target, model.missing_mask,
             compute_ssim=True,
         )
+        sample_metrics = _per_sample_metrics(
+            mel_completed,
+            model.mel_target,
+            model.missing_mask,
+            model.mel_corrupted,
+        )
         total["psnr_full_sum"] += metrics["psnr_full_sum"]
         total["psnr_missing_sum"] += metrics["psnr_missing_sum"]
+        total["mel_l1_full_sum"] += sum(sample_metrics["mel_l1_full"])
+        total["mel_l1_missing_sum"] += sum(sample_metrics["mel_l1_missing"])
+        total["known_max_abs_err_sum"] += sum(
+            sample_metrics["known_region_max_abs_error"]
+        )
+        total["known_max_abs_err_max"] = max(
+            total["known_max_abs_err_max"],
+            max(sample_metrics["known_region_max_abs_error"]),
+        )
+        total["boundary_l1_sum"] += sum(sample_metrics["boundary_l1"])
         sample_count += metrics["num_samples"]
         if metrics.get("ssim_full_sum") is not None:
             total["ssim_full_sum"] += metrics["ssim_full_sum"]
@@ -214,8 +295,14 @@ def main():
                 "end": int(getattr(spec, "end", -1)),
                 "gap_frames": int(getattr(spec, "gap_frames", -1)),
                 "video_condition": str(cond),
+                "mel_l1_full": float(sample_metrics["mel_l1_full"][i]),
+                "mel_l1_missing": float(sample_metrics["mel_l1_missing"][i]),
+                "psnr_full_db": float(sample_metrics["psnr_full_db"][i]),
+                "psnr_missing_db": float(sample_metrics["psnr_missing_db"][i]),
+                "ssim_full": float(sample_metrics["ssim_full"][i]),
+                "boundary_l1": float(sample_metrics["boundary_l1"][i]),
                 "known_region_max_abs_error": float(
-                    known_error.cpu().item()
+                    sample_metrics["known_region_max_abs_error"][i]
                 ),
             }
             all_records.append(record)
@@ -248,10 +335,16 @@ def main():
         "num_samples": sample_count,
         "psnr_full_db": total["psnr_full_sum"] / n,
         "psnr_missing_db": total["psnr_missing_sum"] / n,
+        "mel_l1_full": total["mel_l1_full_sum"] / n,
+        "mel_l1_missing": total["mel_l1_missing_sum"] / n,
         "ssim_full": total["ssim_full_sum"] / ns,
+        "boundary_l1": total["boundary_l1_sum"] / n,
+        "known_region_max_abs_error_mean": total["known_max_abs_err_sum"] / n,
+        "known_region_max_abs_error_max": total["known_max_abs_err_max"],
+        "video_degradation": getattr(hparams, "uq_video_degradation", "original"),
         "inference_steps": inference_steps,
-        "ddim_eta": 0.0,
-        "num_candidates": 1,
+        "ddim_eta": ddim_eta,
+        "num_candidates": num_candidates,
     }
 
     # Write summary.json
@@ -289,9 +382,9 @@ def main():
         )
         for batch in data_loader:
             result = model.sample(
-                batch, num_candidates=1,
+                batch, num_candidates=num_candidates,
                 inference_steps=inference_steps,
-                ddim_eta=0.0,
+                ddim_eta=ddim_eta,
             )
             mel_completed = result["completed_mels"][:, 0]
             _vocoder_export(

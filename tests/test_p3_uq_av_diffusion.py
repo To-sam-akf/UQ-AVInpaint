@@ -16,12 +16,16 @@ Covers:
 import importlib
 import os
 import sys
+from pathlib import Path
 
+import cv2
+import numpy as np
 import pytest
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from Data_loaders.uq_av_loader import create_uq_av_dataloader
 from networks.uq.diffusion_schedule import (
     DiffusionSchedule,
     linear_beta_schedule,
@@ -155,6 +159,13 @@ class TestDiffusionSchedule:
         assert sched.alphas_cumprod[-1] < 0.01
         # Cosine schedule should have near-linear beta start
         assert sched.betas[0] < sched.betas[-1]
+
+    def test_ddim_timesteps_include_zero_and_requested_transitions(self):
+        sched = DiffusionSchedule(timesteps=1000)
+        timesteps = sched.get_ddim_timesteps(inference_steps=50)
+        assert timesteps[0].item() == 999
+        assert timesteps[-1].item() == 0
+        assert len(timesteps) - 1 == 50
 
 
 # ===================================================================
@@ -435,8 +446,8 @@ class TestVideoEncoderP3:
         B = video_batch.size(0)
         F = video_batch.size(1)
 
-        assert out["rgb_tokens"].shape == (B, F, 64)
-        assert out["flow_tokens"].shape == (B, F, 64)
+        assert out["rgb_tokens"].shape == (B, F, 128)
+        assert out["flow_tokens"].shape == (B, F, 128)
         assert out["video_tokens"].shape == (B, F, 128)
 
     def test_different_videos_different_tokens(self, device):
@@ -570,6 +581,61 @@ class TestEndToEndSmoke:
         assert not torch.isnan(torch.tensor(model.loss_total_item))
         assert not torch.isinf(torch.tensor(model.loss_total_item))
         assert model.loss_diff_item > 0
+
+    def test_training_step_backprops_into_video_and_boundary(self, device, tmp_path):
+        """Video encoder and boundary auxiliary loss must both train."""
+        hparams = self._make_hparams(tmp_path)
+        hparams.uq_lambda_boundary = 1.0
+        model = UQAVDiffusionModel(hparams, device=device)
+
+        B = 1
+        batch = {
+            "sample_id": ["s1"],
+            "mel_target": torch.rand(B, 1, 80, 200),
+            "mel_corrupted": torch.rand(B, 1, 80, 200),
+            "missing_mask": torch.zeros(B, 1, 80, 200),
+            "boundary_map": torch.zeros(B, 2, 80, 200),
+            "video": torch.randn(B, 50, 3, 64, 64),
+            "flow": torch.randn(B, 50, 2, 64, 64),
+            "audio_target": torch.randn(B, 64000),
+            "mask_spec": [None],
+            "video_condition": ["original"],
+            "video_degradation": [{}],
+        }
+        batch["missing_mask"][:, :, :, 60:80] = 1.0
+
+        model.set_input(batch)
+        model.optimize_parameters(global_step=0)
+
+        video_grad = sum(
+            p.grad.abs().sum().item()
+            for p in model.video_encoder.parameters()
+            if p.grad is not None
+        )
+        assert video_grad > 0.0
+        assert model.loss_boundary.requires_grad
+        assert model.loss_total.requires_grad
+
+    def test_uq_cli_schedule_params_take_precedence(self, device, tmp_path):
+        hparams = self._make_hparams(tmp_path)
+        hparams.diff_timesteps = 100
+        hparams.diff_beta_start = 1e-4
+        hparams.diff_beta_end = 0.02
+        hparams.uq_diffusion_timesteps = 37
+        hparams.uq_beta_start = 0.001
+        hparams.uq_beta_end = 0.01
+        hparams.uq_beta_schedule = "linear"
+
+        model = UQAVDiffusionModel(hparams, device=device)
+        assert model.diffusion.timesteps == 37
+        assert torch.isclose(
+            model.diffusion.betas[0].cpu(), torch.tensor(0.001),
+            atol=1e-7,
+        )
+        assert torch.isclose(
+            model.diffusion.betas[-1].cpu(), torch.tensor(0.01),
+            atol=1e-7,
+        )
 
     def test_test_forward(self, device, tmp_path):
         """Run test forward pass and verify Mel pred shape."""
@@ -718,6 +784,28 @@ class TestEndToEndSmoke:
             r1["candidate_mels"], r2["candidate_mels"], atol=1e-6, rtol=0.0,
         ), "Same seed should produce near-identical outputs (CUDA may introduce epsilon differences)"
 
+    def test_real_video_checkpoint_loads_in_no_video_mode(self, device, tmp_path):
+        hparams = self._make_hparams(tmp_path)
+        model = UQAVDiffusionModel(hparams, device=device)
+        ckpt_path = model.save_checkpoint(
+            global_step=7,
+            global_epoch=2,
+            checkpoint_dir=str(tmp_path),
+        )
+
+        no_video_hparams = self._make_hparams(tmp_path)
+        no_video_hparams.uq_no_video = True
+        no_video_model = UQAVDiffusionModel(no_video_hparams, device=device)
+        step, epoch = no_video_model.load_checkpoint(
+            ckpt_path,
+            reset_optimizer=True,
+        )
+
+        assert step == 7
+        assert epoch == 2
+        assert no_video_model._loaded_step == 7
+        assert isinstance(no_video_model.video_encoder, VideoConditionDummy)
+
     def test_models_importable(self):
         """Verify all P3 modules can be imported via importlib."""
         assert UQAVDiffusionModel is not None
@@ -784,3 +872,99 @@ class TestVideoConditions:
         model = UQAVDiffusionModel(hparams, device=device)
         assert isinstance(model.video_encoder, VideoConditionDummy)
         assert not model.use_video
+
+    def _write_tiny_uq_dataset(self, root):
+        sample_ids = [
+            "processed/piano/video_a/clip_000001",
+            "processed/piano/video_b/clip_000001",
+        ]
+        for sample_index, sample_id in enumerate(sample_ids):
+            sample_dir = Path(root) / sample_id
+            for name in ("image_crop", "flow_x_crop", "flow_y_crop"):
+                (sample_dir / name).mkdir(parents=True, exist_ok=True)
+
+            mel = np.full((200, 80), sample_index / 10.0, dtype=np.float32)
+            audio = np.zeros((64000,), dtype=np.float32)
+            np.save(sample_dir / "mel.npy", mel, allow_pickle=False)
+            np.save(sample_dir / "raw_audio.npy", audio, allow_pickle=False)
+
+            for frame_id in range(1, 51):
+                image = np.full(
+                    (8, 8, 3),
+                    20 + sample_index * 100 + frame_id,
+                    dtype=np.uint8,
+                )
+                flow_x = np.full((8, 8), 127 + sample_index, dtype=np.uint8)
+                flow_y = np.full((8, 8), 127 - sample_index, dtype=np.uint8)
+                cv2.imwrite(
+                    str(sample_dir / "image_crop" / f"{frame_id}.jpg"),
+                    image,
+                )
+                cv2.imwrite(
+                    str(sample_dir / "flow_x_crop" / f"{frame_id}.jpg"),
+                    flow_x,
+                )
+                cv2.imwrite(
+                    str(sample_dir / "flow_y_crop" / f"{frame_id}.jpg"),
+                    flow_y,
+                )
+
+        split_path = Path(root) / "test_av_split.txt"
+        with split_path.open("w", encoding="utf-8") as handle:
+            for sample_id in sample_ids:
+                handle.write(
+                    f"{sample_id}|{sample_id}/mel.npy|"
+                    f"{sample_id}/raw_audio.npy|200\n"
+                )
+
+        manifest = {
+            sample_id: [
+                {
+                    "mask_type": "random",
+                    "start": 50,
+                    "end": 70,
+                    "gap_frames": 20,
+                    "seed": 123,
+                }
+            ]
+            for sample_id in sample_ids
+        }
+        return manifest
+
+    def test_loader_video_degradation_conditions(self, tmp_path):
+        manifest = self._write_tiny_uq_dataset(tmp_path)
+
+        no_video_loader = create_uq_av_dataloader(
+            data_root=tmp_path,
+            split_name="test_av_split.txt",
+            phase="test",
+            mask_manifest=manifest,
+            video_conditions=("no_video",),
+            image_size=8,
+            batch_size=2,
+            num_workers=0,
+            pin_memory=False,
+        )
+        no_video_batch = next(iter(no_video_loader))
+        assert no_video_batch["video_condition"] == ["no_video", "no_video"]
+        assert no_video_batch["video"].abs().sum().item() == 0.0
+        assert no_video_batch["flow"].abs().sum().item() == 0.0
+
+        wrong_video_loader = create_uq_av_dataloader(
+            data_root=tmp_path,
+            split_name="test_av_split.txt",
+            phase="test",
+            mask_manifest=manifest,
+            video_conditions=("wrong_video",),
+            image_size=8,
+            batch_size=2,
+            num_workers=0,
+            pin_memory=False,
+        )
+        wrong_video_batch = next(iter(wrong_video_loader))
+        assert wrong_video_batch["video_condition"] == [
+            "wrong_video", "wrong_video",
+        ]
+        assert "wrong_video_sample_id" in wrong_video_batch[
+            "video_degradation"
+        ][0]

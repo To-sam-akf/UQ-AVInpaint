@@ -649,23 +649,23 @@ L = L_diff + lambda_boundary * L_boundary + lambda_sync * L_sync
 
 | 测试文件 | 测试数量 | 结果 |
 |---|---|---|
-| `tests/test_p3_uq_av_diffusion.py` | 40 | ✅ 全部通过 |
+| `tests/test_p3_uq_av_diffusion.py` | 45 | ✅ 全部通过 |
 
-**P0+P1+P2+P3 回归: 140/140 测试通过 (100%)**
+**P0+P1+P2+P3 回归: 145/145 测试通过 (100%)**
 
 #### 测试覆盖明细
 
 | 测试类 | 测试数 | 覆盖内容 |
 |---|---|---|
-| `TestDiffusionSchedule` | 6 | beta shape/range, alpha_bar 递减, q_sample shape, t=0 低噪声, t=T 纯噪声, cosine schedule |
+| `TestDiffusionSchedule` | 7 | beta shape/range, alpha_bar 递减, q_sample shape, t=0 低噪声, t=T 纯噪声, cosine schedule, DDIM timestep 到 t=0 |
 | `TestMaskDownsampling` | 6 | mask_z shape [B,1,10,50], 二值性, known→0, full→1, boundary map shape, 确定性 |
 | `TestMaskedNoising` | 4 | known region 严格保留, missing region 被噪声化, compose_known_region, masked diffusion loss |
 | `TestKnownRegionClamp` | 2 | DDPM step 后 known 保留, DDIM step 后 known 保留 |
 | `TestLatentDiffusionUNet` | 7 | input/output shape, without-video mode, 确定性, 不同 t 不同输出, sinusoidal embedding, TimeEmbedding, 无 NaN/Inf |
 | `TestVideoEncoderP3` | 5 | rgb/flow/video tokens shape, 不同视频不同 tokens, 确定性, dummy encoder, 无 NaN/Inf |
-| `TestEndToEndSmoke` | 6 | 1 training step (forward+backward), test forward (Mel pred shape), K=1 DDIM sampling (shape + null scorer/evidence), known region compose 误差严格 < 1e-5, 固定 seed 可复现 (allclose), 所有模块可 import |
+| `TestEndToEndSmoke` | 9 | 1 training step (forward+backward), video encoder 梯度, boundary loss 可导, UQ schedule CLI 参数生效, no-video checkpoint 兼容, test forward (Mel pred shape), K=1 DDIM sampling (shape + null scorer/evidence), known region compose 误差严格 < 1e-5, 固定 seed 可复现 (allclose), 所有模块可 import |
 | `TestDiffusionEdgeCases` | 3 | 单步 schedule, deterministic q_sample (same noise), different noise → different sample |
-| `TestVideoConditions` | 1 | `--uq_no_video` flag 使用 VideoConditionDummy |
+| `TestVideoConditions` | 2 | `--uq_no_video` flag 使用 VideoConditionDummy, loader 支持 no_video/wrong_video 条件 |
 
 #### 验证项逐项确认
 
@@ -684,7 +684,7 @@ L = L_diff + lambda_boundary * L_boundary + lambda_sync * L_sync
 | 11 | U-Net 确定性 (eval 模式) | 相同输入 forward 两次 | `test_unet_deterministic` | ✅ 完全一致 |
 | 12 | U-Net 不同 timestep 不同输出 | t=0 vs t=500 | `test_unet_different_t_gives_different_output` | ✅ 输出不同 |
 | 13 | Without-video 模式可用 | video_tokens=None → forward 正常 | `test_unet_without_video` | ✅ shape 正确 |
-| 14 | Video encoder shape 合约 | [B,50,3,64,64] + [B,50,2,64,64] → tokens [B,50,D] | `test_output_shapes` | ✅ 精确匹配 |
+| 14 | Video encoder shape 合约 | [B,50,3,64,64] + [B,50,2,64,64] → rgb/flow/video tokens [B,50,D] | `test_output_shapes` | ✅ 精确匹配 |
 | 15 | Video encoder 确定性 | 相同输入 → 相同输出 | `test_deterministic` | ✅ 完全一致 |
 | 16 | Dummy encoder 返回零 tokens | `VideoConditionDummy` → all zeros | `test_dummy_encoder` | ✅ 全零, shape 正确 |
 | 17 | 1 步训练 forward/backward 可完成 | `optimize_parameters(0)` 后 loss > 0 且有限 | `test_one_training_step` | ✅ loss_diff > 0, 无 NaN/Inf |
@@ -692,6 +692,12 @@ L = L_diff + lambda_boundary * L_boundary + lambda_sync * L_sync
 | 19 | K=1 DDIM sampling shape | `model.sample(num_candidates=1)` → candidate_mels [B,1,1,80,200] | `test_sample_k1` | ✅ 所有 field 匹配, scorer/evidence=null |
 | 20 | 固定 seed 可复现 | 两次 `sample(seed=42)` → allclose | `test_fixed_seed_reproducibility` | ✅ allclose(atol=1e-6) |
 | 21 | no-video flag 使用 dummy encoder | `uq_no_video=True` → VideoConditionDummy, use_video=False | `test_no_video_flag` | ✅ dummy 激活 |
+| 22 | 视频分支参与训练 | 1 step backward 后 video encoder grad sum > 0 | `test_training_step_backprops_into_video_and_boundary` | ✅ 有非零梯度 |
+| 23 | boundary loss 参与反传 | `loss_boundary.requires_grad` 与 `loss_total.requires_grad` 检查 | `test_training_step_backprops_into_video_and_boundary` | ✅ 可导 |
+| 24 | DDIM 采样走到 t=0 | `get_ddim_timesteps(50)` → len-1=50 且最后一个 timestep=0 | `test_ddim_timesteps_include_zero_and_requested_transitions` | ✅ 50 次转移 |
+| 25 | UQ CLI schedule 参数生效 | `uq_diffusion_timesteps/uq_beta_start/uq_beta_end` 覆盖旧 diff 字段 | `test_uq_cli_schedule_params_take_precedence` | ✅ 优先生效 |
+| 26 | no-video 可加载 AV checkpoint | real-video checkpoint → `uq_no_video=True` 模型 load | `test_real_video_checkpoint_loads_in_no_video_mode` | ✅ 跳过 video encoder 权重 |
+| 27 | loader 视觉退化条件可用 | `video_conditions=("no_video",)` 与 `("wrong_video",)` | `test_loader_video_degradation_conditions` | ✅ condition 正确 |
 
 #### 新增文件
 
@@ -743,12 +749,12 @@ U-Net: input [B, 2*latent_dim+3, 10, 50] → 4 encoder levels (strides 1, (2,1),
 # P3 验证命令
 # ============================================================
 
-# 1. 运行 P3 单元测试 (40 tests)
+# 1. 运行 P3 单元测试 (45 tests)
 PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python -m pytest \
   tests/test_p3_uq_av_diffusion.py \
   -v --tb=short
 
-# 2. 运行 P0+P1+P2+P3 回归测试 (140 tests)
+# 2. 运行 P0+P1+P2+P3 回归测试 (145 tests)
 PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python -m pytest \
   tests/test_baseline_protocol.py \
   tests/test_baseline_runner.py \
@@ -828,14 +834,36 @@ PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \
 
 # 8. No-video ablation (验证模型确实使用视觉条件)
 PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \
-  --uq_no_video \
   --name UQ-AV-K1-no-video \
   --data_root /root/shared-nvme/data \
   --test_split_name test_av_split.txt \
   --ae_checkpoint /root/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
   --resume_path /root/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/uq_av_k1/UQ-AV_checkpoint_step*.pth.tar \
+  --uq_video_degradation no_video \
   --batch_size 8 --num_workers 4 --display_id 0 \
   --results_dir checkpoints/uq_av_k1_test_results_no_video
+
+# 9. Wrong-video ablation (替换为同乐器/其他视频的视觉条件)
+PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \
+  --name UQ-AV-K1-wrong-video \
+  --data_root /root/shared-nvme/data \
+  --test_split_name test_av_split.txt \
+  --ae_checkpoint /root/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
+  --resume_path /root/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/uq_av_k1/UQ-AV_checkpoint_step*.pth.tar \
+  --uq_video_degradation wrong_video \
+  --batch_size 8 --num_workers 4 --display_id 0 \
+  --results_dir checkpoints/uq_av_k1_test_results_wrong_video
+
+# 10. Dummy-token ablation (跳过视频 encoder 权重, 直接喂零 token)
+PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \
+  --uq_no_video \
+  --name UQ-AV-K1-dummy-token \
+  --data_root /root/shared-nvme/data \
+  --test_split_name test_av_split.txt \
+  --ae_checkpoint /root/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
+  --resume_path /root/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/uq_av_k1/UQ-AV_checkpoint_step*.pth.tar \
+  --batch_size 8 --num_workers 4 --display_id 0 \
+  --results_dir checkpoints/uq_av_k1_test_results_dummy_token
 ```
 
 ## 5. P4：Multi-Hypothesis Sampling

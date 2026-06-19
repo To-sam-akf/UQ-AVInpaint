@@ -213,11 +213,13 @@ class DiffusionSchedule:
         z_0_pred = torch.clamp(z_0_pred, -4.0, 4.0)
 
         # DDIM update
-        sigma = eta * torch.sqrt(
+        sigma_term = (
             (1.0 - a_bar_next) / (1.0 - a_bar_t)
             * (1.0 - a_bar_t / a_bar_next)
-        )
-        pred_dir = torch.sqrt(1.0 - a_bar_next - sigma ** 2) * epsilon_pred
+        ).clamp(min=0.0)
+        sigma = eta * torch.sqrt(sigma_term)
+        pred_dir_scale = (1.0 - a_bar_next - sigma ** 2).clamp(min=0.0)
+        pred_dir = torch.sqrt(pred_dir_scale) * epsilon_pred
         z_next = torch.sqrt(a_bar_next) * z_0_pred + pred_dir
 
         if eta > 0:
@@ -232,15 +234,19 @@ class DiffusionSchedule:
         """Return linearly-spaced timesteps for DDIM sampling.
 
         Args:
-            inference_steps: number of DDIM steps (e.g. 50).
+            inference_steps: number of denoising transitions (e.g. 50).
         Returns:
-            timesteps: [inference_steps] descending from T-1 to 0.
+            timesteps: [inference_steps + 1] descending from T-1 to 0.
         """
-        step = self.timesteps // inference_steps
-        order = torch.arange(
-            self.timesteps - 1, -1, -step, dtype=torch.long
-        )
-        return order[:inference_steps]
+        inference_steps = int(inference_steps)
+        if inference_steps < 1:
+            raise ValueError("inference_steps must be >= 1")
+        return torch.linspace(
+            self.timesteps - 1,
+            0,
+            steps=inference_steps + 1,
+            dtype=torch.float64,
+        ).round().long()
 
 
 def compute_diffusion_loss(epsilon_pred, epsilon, mask_z):

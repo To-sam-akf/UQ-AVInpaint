@@ -14,7 +14,6 @@ Architecture:
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
 
 def _conv_relu(in_ch, out_ch, kernel=3, stride=2, padding=1):
@@ -82,7 +81,10 @@ class VideoEvidenceEncoderP3(nn.Module):
             image_size=image_size,
         )
 
-        fusion_dim = rgb_feature_dim + flow_feature_dim
+        self.rgb_projection = nn.Linear(rgb_feature_dim, video_dim)
+        self.flow_projection = nn.Linear(flow_feature_dim, video_dim)
+
+        fusion_dim = video_dim * 2
         self.fusion = nn.Sequential(
             nn.Linear(fusion_dim, video_dim),
             nn.ReLU(inplace=True),
@@ -125,12 +127,15 @@ class VideoEvidenceEncoderP3(nn.Module):
         rgb_feat = rgb_feat.view(B, F, -1)       # [B, F, rgb_feature_dim]
         flow_feat = flow_feat.view(B, F, -1)     # [B, F, flow_feature_dim]
 
-        fused = torch.cat([rgb_feat, flow_feat], dim=-1)  # [B, F, fusion_dim]
-        video_tokens = self.fusion(fused)                  # [B, F, video_dim]
+        rgb_tokens = self.rgb_projection(rgb_feat)       # [B, F, video_dim]
+        flow_tokens = self.flow_projection(flow_feat)    # [B, F, video_dim]
+
+        fused = torch.cat([rgb_tokens, flow_tokens], dim=-1)
+        video_tokens = self.fusion(fused)                # [B, F, video_dim]
 
         return {
-            "rgb_tokens": rgb_feat,
-            "flow_tokens": flow_feat,
+            "rgb_tokens": rgb_tokens,
+            "flow_tokens": flow_tokens,
             "video_tokens": video_tokens,
         }
 

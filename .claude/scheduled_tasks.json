@@ -5,7 +5,7 @@
       "cron": "*/15 * * * *",
       "prompt": "Monitor the UQ-AV K=1 training process and report results to the user. Check:\n1. Whether training processes are still running (ps aux | grep train-uq-av)\n2. GPU utilization and memory (nvidia-smi)\n3. Latest checkpoint file (ls -lt checkpoints/uq_av_k1/*.pth.tar)\n4. TensorBoard events file size (ls -la checkpoints/uq_av_k1/events/)\n5. Process uptime and CPU usage\n\nSummarize the training progress clearly in Chinese. If training has stopped or crashed, report that immediately.",
       "createdAt": 1781840395158,
-      "lastFiredAt": 1781842834312,
+      "lastFiredAt": 1781856765478,
       "recurring": true,
       "createdBySessionId": "458b7484-f47e-4bd7-9839-963d898045c1",
       "createdByPid": 14800,

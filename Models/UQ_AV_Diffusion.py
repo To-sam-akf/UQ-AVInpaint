@@ -68,10 +68,31 @@ class UQAVDiffusionModel:
         self.latent_is_normalised = False
 
         # --- Diffusion schedule ---
-        diff_timesteps = int(getattr(hparams, "diff_timesteps", 1000))
-        diff_beta_start = float(getattr(hparams, "diff_beta_start", 1e-4))
-        diff_beta_end = float(getattr(hparams, "diff_beta_end", 0.02))
-        diff_schedule = getattr(hparams, "diff_schedule", "linear")
+        diff_timesteps = int(
+            getattr(
+                hparams, "uq_diffusion_timesteps",
+                getattr(hparams, "diff_timesteps", 1000),
+            )
+        )
+        diff_beta_start = float(
+            getattr(
+                hparams, "uq_beta_start",
+                getattr(hparams, "diff_beta_start", 1e-4),
+            )
+        )
+        diff_beta_end = float(
+            getattr(
+                hparams, "uq_beta_end",
+                getattr(hparams, "diff_beta_end", 0.02),
+            )
+        )
+        diff_schedule = getattr(
+            hparams, "uq_beta_schedule",
+            getattr(
+                hparams, "uq_schedule_type",
+                getattr(hparams, "diff_schedule", "linear"),
+            ),
+        )
         self.diffusion = DiffusionSchedule(
             timesteps=diff_timesteps,
             beta_start=diff_beta_start,
@@ -242,9 +263,9 @@ class UQAVDiffusionModel:
                 self.boundary_map, target_size=(10, 50)
             ).to(self.device)
 
-            # Video tokens
-            video_out = self.video_encoder(self.video, self.flow)
-            self.video_tokens = video_out["video_tokens"]
+        # Video conditioning is trainable in P3; keep it outside no_grad.
+        video_out = self.video_encoder(self.video, self.flow)
+        self.video_tokens = video_out["video_tokens"]
 
         # Sample random timesteps
         B = self.z_target.size(0)
@@ -274,15 +295,14 @@ class UQAVDiffusionModel:
             epsilon_pred, epsilon, self.mask_z,
         )
 
-        # Boundary loss: decode predicted z_0, compute Mel gradient error
-        with torch.no_grad():
-            alpha_bar_t = self.diffusion.alphas_cumprod[t].to(self.device)[
-                :, None, None, None
-            ]
-            z_0_pred = (
-                z_t - torch.sqrt(1.0 - alpha_bar_t) * epsilon_pred.detach()
-            ) / torch.sqrt(alpha_bar_t)
-            mel_0_pred = self._decode_latent(z_0_pred)
+        # Boundary loss: keep gradient through epsilon_pred and frozen decoder.
+        alpha_bar_t = self.diffusion.alphas_cumprod[t].to(self.device)[
+            :, None, None, None
+        ]
+        z_0_pred = (
+            z_t - torch.sqrt(1.0 - alpha_bar_t) * epsilon_pred
+        ) / torch.sqrt(alpha_bar_t)
+        mel_0_pred = self._decode_latent(z_0_pred)
 
         self.loss_boundary = self._boundary_loss(
             mel_0_pred, self.mel_target, self.missing_mask,
@@ -380,6 +400,10 @@ class UQAVDiffusionModel:
 
         B = self.z_context.size(0)
         K = int(num_candidates)
+        if K != 1:
+            raise ValueError(
+                f"P3 only supports K=1 sampling; got num_candidates={K}."
+            )
 
         candidate_mels = []
         candidate_latents = []
@@ -586,9 +610,21 @@ class UQAVDiffusionModel:
     def load_checkpoint(self, checkpoint_path, reset_optimizer=False):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
         self.unet.load_state_dict(checkpoint["unet"])
-        self.video_encoder.load_state_dict(checkpoint["video_encoder"])
+        if self.use_video:
+            self.video_encoder.load_state_dict(checkpoint["video_encoder"])
+        else:
+            print(
+                "[UQ-AV] Skipping video_encoder weights because "
+                "--uq_no_video uses VideoConditionDummy."
+            )
         if not reset_optimizer and checkpoint.get("optimizer") is not None:
-            self.optimizer.load_state_dict(checkpoint["optimizer"])
+            try:
+                self.optimizer.load_state_dict(checkpoint["optimizer"])
+            except ValueError as exc:
+                print(
+                    "[UQ-AV] Skipping optimizer state due to parameter "
+                    f"mismatch: {exc}"
+                )
         self.latent_mean = checkpoint.get("latent_mean")
         self.latent_std = checkpoint.get("latent_std")
         if self.latent_mean is not None and self.latent_std is not None:
@@ -597,4 +633,6 @@ class UQAVDiffusionModel:
             self.latent_is_normalised = True
         global_step = int(checkpoint.get("global_step", 0))
         global_epoch = int(checkpoint.get("global_epoch", 0))
+        self._loaded_step = global_step
+        self._loaded_epoch = global_epoch
         return global_step, global_epoch

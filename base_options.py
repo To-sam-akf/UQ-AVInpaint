@@ -375,6 +375,18 @@ class BaseOptions(object):
             help="Total diffusion timesteps (training schedule length).",
         )
         self.parser.add_argument(
+            "--uq_beta_start",
+            type=float,
+            default=1e-4,
+            help="Initial beta for the UQ diffusion noise schedule.",
+        )
+        self.parser.add_argument(
+            "--uq_beta_end",
+            type=float,
+            default=0.02,
+            help="Final beta for the UQ diffusion noise schedule.",
+        )
+        self.parser.add_argument(
             "--uq_num_candidates",
             type=int,
             default=1,
@@ -413,6 +425,12 @@ class BaseOptions(object):
             choices=["original", "blur", "occlusion", "frame_drop",
                      "temporal_shift", "wrong_video", "no_video"],
             help="Visual degradation condition for evaluation.",
+        )
+        self.parser.add_argument(
+            "--uq_metadata_dir",
+            type=str,
+            default=None,
+            help="Optional UQ metadata directory containing mask manifests and onsets.",
         )
         self.parser.add_argument(
             "--aq_audio_branch_channels",
@@ -476,6 +494,10 @@ class BaseOptions(object):
             opt.normlayer = nn.InstanceNorm2d
         else:
             opt.normlayer = nn.BatchNorm2d
+
+        if opt.uq_schedule_type != "linear" and opt.uq_beta_schedule == "linear":
+            opt.uq_beta_schedule = opt.uq_schedule_type
+        opt.uq_schedule_type = opt.uq_beta_schedule
 
         if not opt.checkpoint_dir:
             opt.checkpoint_dir = os.path.join(opt.checkpoints_dir, opt.name)

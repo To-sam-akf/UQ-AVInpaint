@@ -19,6 +19,8 @@
 | VIAI-AV | `train-viai-av` / `test-viai-av` | 加入 RGB + optical flow 视频分支 |
 | VIAI-AV + sync/probe | `train-viai-av` 默认启用 | 加入 audio-video sync loss 和 VIAI-AA' probe branch，不使用 PatchGAN |
 | VIAI-AV + PatchGAN | `train-viai-av --use_gan` | 在 VIAI-AV 上加入 Mel PatchGAN |
+| Mel AE | `train-mel-ae` / `test-mel-ae` | UQ 路线的冻结 Mel latent autoencoder |
+| UQ-AV K=1 diffusion | `train-uq-av` / `test-uq-av` | P3 条件 AV latent diffusion，K=1 |
 | Vocoder 输出 | 测试时加 `--use_vocoder` | 使用 Griffin-Lim 将修复 Mel 导出为 wav |
 
 说明：第五阶段使用 Griffin-Lim，不需要训练 WaveNet，也不需要下载 HiFi-GAN/WaveGlow 预训练模型。它适合快速跑通端到端 demo，音质不等价于论文完整 WaveNet 设置。
@@ -429,6 +431,111 @@ python main.py test-viai-av -- \
 ```text
 <results_dir>/wav/stepXXXXXXXXX/*_reconstructed.wav
 <results_dir>/wav/stepXXXXXXXXX/*_target.wav
+```
+
+### 4.7 UQ-AV K=1 latent diffusion (P3)
+
+P3 需要先完成 P2 Mel AE 训练，并把 `--ae_checkpoint` 指向对应 checkpoint。该阶段只支持
+`--uq_num_candidates 1`，multi-candidate/scorer/calibration 留到后续阶段。
+
+1 step sanity check：
+
+```bash
+PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py train-uq-av -- \
+  --name UQ-AV-K1-smoke \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --ae_checkpoint checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
+  --batch_size 1 \
+  --num_workers 0 \
+  --max_train_steps 1 \
+  --display_id 0 \
+  --print_freq 1
+```
+
+正式训练：
+
+```bash
+PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py train-uq-av -- \
+  --name UQ-AV-K1 \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --ae_checkpoint checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
+  --batch_size 8 \
+  --nepochs 100 \
+  --uq_lambda_boundary 0.1 \
+  --uq_unet_base_channels 128 \
+  --checkpoint_interval 1000 \
+  --print_freq 100 \
+  --display_id 0 \
+  --checkpoint_dir checkpoints/uq_av_k1 \
+  --log_event_path checkpoints/uq_av_k1/events
+```
+
+Original video 测试：
+
+```bash
+PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \
+  --name UQ-AV-K1-original \
+  --data_root "$DATA_ROOT" \
+  --test_split_name test_av_split.txt \
+  --ae_checkpoint checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
+  --resume_path checkpoints/uq_av_k1/UQ-AV_checkpoint_step000100000.pth.tar \
+  --uq_video_degradation original \
+  --batch_size 8 \
+  --num_workers 4 \
+  --display_id 0 \
+  --results_dir checkpoints/uq_av_k1_test_results_original \
+  --use_vocoder \
+  --vocoder_n_iter 32 \
+  --vocoder_max_samples 20
+```
+
+No-video / wrong-video ablation：
+
+```bash
+PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \
+  --name UQ-AV-K1-no-video \
+  --data_root "$DATA_ROOT" \
+  --test_split_name test_av_split.txt \
+  --ae_checkpoint checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
+  --resume_path checkpoints/uq_av_k1/UQ-AV_checkpoint_step000100000.pth.tar \
+  --uq_video_degradation no_video \
+  --batch_size 8 \
+  --num_workers 4 \
+  --display_id 0 \
+  --results_dir checkpoints/uq_av_k1_test_results_no_video
+
+PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \
+  --name UQ-AV-K1-wrong-video \
+  --data_root "$DATA_ROOT" \
+  --test_split_name test_av_split.txt \
+  --ae_checkpoint checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
+  --resume_path checkpoints/uq_av_k1/UQ-AV_checkpoint_step000100000.pth.tar \
+  --uq_video_degradation wrong_video \
+  --batch_size 8 \
+  --num_workers 4 \
+  --display_id 0 \
+  --results_dir checkpoints/uq_av_k1_test_results_wrong_video
+```
+
+`--uq_no_video` 保留为 dummy-token ablation，可加载同一个 AV checkpoint，但会跳过
+video encoder 权重：
+
+```bash
+PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \
+  --uq_no_video \
+  --name UQ-AV-K1-dummy-token \
+  --data_root "$DATA_ROOT" \
+  --test_split_name test_av_split.txt \
+  --ae_checkpoint checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
+  --resume_path checkpoints/uq_av_k1/UQ-AV_checkpoint_step000100000.pth.tar \
+  --batch_size 8 \
+  --num_workers 4 \
+  --display_id 0 \
+  --results_dir checkpoints/uq_av_k1_test_results_dummy_token
 ```
 
 ## 5. 指标与结果查看
