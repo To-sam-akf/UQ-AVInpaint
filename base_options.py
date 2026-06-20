@@ -351,6 +351,68 @@ class BaseOptions(object):
             help="Weight of the audio-visual sync auxiliary loss (P5+).",
         )
         self.parser.add_argument(
+            "--uq_lambda_video_margin",
+            type=float,
+            default=0.0,
+            help=(
+                "Weight for P3 original-vs-negative video margin loss. "
+                "Set > 0 to force the model to prefer synchronized video."
+            ),
+        )
+        self.parser.add_argument(
+            "--uq_video_margin",
+            type=float,
+            default=0.02,
+            help="Margin used by the P3 video negative-conditioning loss.",
+        )
+        self.parser.add_argument(
+            "--uq_video_margin_negative",
+            type=str,
+            choices=["cycle", "batch_shuffle", "temporal_shuffle", "no_video"],
+            default="cycle",
+            help="Negative video construction used by P3 video margin loss.",
+        )
+        self.parser.add_argument(
+            "--uq_teacher_type",
+            type=str,
+            choices=["none", "patchgan", "audio_only_diffusion"],
+            default="none",
+            help="Optional P5 teacher used for missing-region distillation.",
+        )
+        self.parser.add_argument(
+            "--uq_teacher_checkpoint",
+            type=str,
+            default=None,
+            help="Checkpoint for the P5 teacher model.",
+        )
+        self.parser.add_argument(
+            "--uq_teacher_ae_checkpoint",
+            type=str,
+            default=None,
+            help=(
+                "AE checkpoint for an audio-only diffusion teacher. "
+                "Defaults to --ae_checkpoint when omitted."
+            ),
+        )
+        self.parser.add_argument(
+            "--uq_lambda_distill",
+            type=float,
+            default=0.0,
+            help="Weight for P5 missing-region teacher distillation.",
+        )
+        self.parser.add_argument(
+            "--uq_teacher_inference_steps",
+            type=int,
+            default=50,
+            help="DDIM steps used when the teacher is audio_only_diffusion.",
+        )
+        self.parser.add_argument(
+            "--uq_teacher_ddim_eta",
+            type=float,
+            default=0.0,
+            help="DDIM eta used when the teacher is audio_only_diffusion.",
+        )
+        self.parser.add_argument(
             "--uq_lr",
             type=float,
             default=None,
@@ -367,6 +429,41 @@ class BaseOptions(object):
             type=int,
             default=50,
             help="Number of DDIM steps during inference.",
+        )
+        self.parser.add_argument(
+            "--uq_val_inference_steps",
+            type=int,
+            default=None,
+            help=(
+                "Number of DDIM steps during train-uq-av validation sampling. "
+                "Defaults to --uq_inference_steps."
+            ),
+        )
+        self.parser.add_argument(
+            "--uq_early_stop_patience",
+            type=int,
+            default=10,
+            help=(
+                "Stop train-uq-av after this many validation epochs without "
+                "meaningful improvement."
+            ),
+        )
+        self.parser.add_argument(
+            "--uq_early_stop_min_delta",
+            type=float,
+            default=0.0,
+            help="Minimum validation metric delta counted as an improvement.",
+        )
+        self.parser.add_argument(
+            "--uq_early_stop_metric",
+            type=str,
+            default="val_sample_psnr_missing_db",
+            help="Validation sampling metric used for best checkpoint and early stop.",
+        )
+        self.parser.add_argument(
+            "--uq_disable_early_stop",
+            action="store_true",
+            help="Keep saving best checkpoints but do not stop automatically.",
         )
         self.parser.add_argument(
             "--uq_diffusion_timesteps",
@@ -413,17 +510,118 @@ class BaseOptions(object):
             help="Alias for --uq_beta_schedule.",
         )
         self.parser.add_argument(
+            "--uq_prediction_type",
+            type=str,
+            choices=["epsilon", "x0", "v"],
+            default="epsilon",
+            help="Diffusion training target/prediction parameterization.",
+        )
+        self.parser.add_argument(
+            "--uq_latent_clip_value",
+            type=float,
+            default=4.0,
+            help=(
+                "Clamp predicted x0 latents to +/- this value during sampling. "
+                "Set <= 0 to disable latent x0 clipping."
+            ),
+        )
+        self.parser.add_argument(
+            "--uq_require_latent_stats",
+            action="store_true",
+            help="Fail if the AE checkpoint does not include latent mean/std.",
+        )
+        self.parser.add_argument(
+            "--uq_use_ema",
+            action="store_true",
+            help="Maintain EMA shadow weights for UQ diffusion training.",
+        )
+        self.parser.add_argument(
+            "--uq_ema_decay",
+            type=float,
+            default=0.999,
+            help="EMA decay for UQ diffusion weights.",
+        )
+        self.parser.add_argument(
+            "--uq_ema_start_step",
+            type=int,
+            default=0,
+            help="Optimizer step at which EMA updates start.",
+        )
+        self.parser.add_argument(
+            "--uq_ema_eval",
+            action="store_true",
+            help="Load/apply EMA weights for validation or test evaluation.",
+        )
+        self.parser.add_argument(
             "--uq_lambda_diversity",
             type=float,
             default=0.0,
             help="Diversity-target loss weight (P5+).",
         )
         self.parser.add_argument(
+            "--uq_enable_modality_dropout",
+            action="store_true",
+            help=(
+                "Enable P2 classifier-free/modality dropout condition "
+                "sampling during train-uq-av."
+            ),
+        )
+        self.parser.add_argument(
+            "--uq_p_audio_video",
+            type=float,
+            default=0.4,
+            help="Training probability for full audio context + original video.",
+        )
+        self.parser.add_argument(
+            "--uq_p_drop_video",
+            type=float,
+            default=0.2,
+            help="Training probability for full audio context + zero video tokens.",
+        )
+        self.parser.add_argument(
+            "--uq_p_partial_audio_video",
+            type=float,
+            default=0.2,
+            help="Training probability for partial audio context + original video.",
+        )
+        self.parser.add_argument(
+            "--uq_p_wrong_video",
+            type=float,
+            default=0.1,
+            help="Training probability for full audio context + wrong video.",
+        )
+        self.parser.add_argument(
+            "--uq_p_shuffled_video",
+            type=float,
+            default=0.1,
+            help="Training probability for full audio context + shuffled video.",
+        )
+        self.parser.add_argument(
+            "--uq_audio_context_drop_min_ratio",
+            type=float,
+            default=0.15,
+            help="Minimum known-context time ratio hidden for P2 drop-audio.",
+        )
+        self.parser.add_argument(
+            "--uq_audio_context_drop_max_ratio",
+            type=float,
+            default=0.35,
+            help="Maximum known-context time ratio hidden for P2 drop-audio.",
+        )
+        self.parser.add_argument(
+            "--uq_condition_override",
+            type=str,
+            choices=["none", "drop_video", "drop_audio"],
+            default="none",
+            help="Force a P2 condition override during validation/test sampling.",
+        )
+        self.parser.add_argument(
             "--uq_video_degradation",
             type=str,
             default="original",
             choices=["original", "blur", "occlusion", "frame_drop",
-                     "temporal_shift", "wrong_video", "no_video"],
+                     "temporal_shift", "wrong_video", "no_video",
+                     "shuffled_video"],
             help="Visual degradation condition for evaluation.",
         )
         self.parser.add_argument(

@@ -660,3 +660,24 @@ rsync -avz --progress \
   ~/VIAIpro/ \
   root@ackcs-00gjgrzt@ssh.bj8.bz1.paratera.com:/root/Vision-Infused-Audio-Inpainter-VIAI/
 ```
+## 9.下载到本地
+```
+rsync -avz --progress \
+  --exclude='.git/' \
+  --exclude='.venv/' \
+  --exclude='data/' \
+  --exclude='checkpoints/' \
+  --exclude='__pycache__/' \
+  --exclude='*.pyc' \
+  --exclude='*.pth.tar' \
+  --exclude='*.Zone.Identifier' \
+  --exclude='.agents/' \
+  --exclude='.codex' \
+  --exclude='.python-version' \
+  --exclude='NUL' \
+  --exclude='uv.lock' \
+  --exclude='VIAI.pdf' \
+  -e "ssh -p 2233" \
+  root@ackcs-00gjgrzt@ssh.bj8.bz1.paratera.com:/root/Vision-Infused-Audio-Inpainter-VIAI/ \
+  ~/VIAIpro/
+```

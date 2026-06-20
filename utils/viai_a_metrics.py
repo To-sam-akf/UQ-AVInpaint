@@ -1,5 +1,8 @@
 import numpy as np
 import torch
+import torch.nn.functional as F
+
+from networks.uq.mel_autoencoder import time_gradient
 
 
 _IMAGE_WRITE_WARNING_SHOWN = False
@@ -76,6 +79,116 @@ def compute_viai_a_metrics(mel_pred, mel_target, missing_mask, compute_ssim=True
         "psnr_missing": missing_psnr_sum / batch_size,
         "ssim_full": None if ssim_full_sum is None else ssim_full_sum / batch_size,
     }
+    return metrics
+
+
+def compute_inpainting_sample_metrics(
+    mel_completed,
+    mel_target,
+    missing_mask,
+    mel_corrupted=None,
+    compute_ssim=True,
+):
+    """Compute sampling/inpainting metrics for completed Mel predictions.
+
+    This is intentionally shared by validation sampling and test-uq-av so the
+    training-time validation curve has the same scale as formal evaluation.
+    """
+    pred = torch.clamp(_as_bchw(mel_completed).detach(), 0.0, 1.0)
+    target = torch.clamp(_as_bchw(mel_target).detach(), 0.0, 1.0).to(
+        device=pred.device, dtype=pred.dtype
+    )
+    mask = _as_bchw(missing_mask.detach()).to(
+        device=pred.device, dtype=pred.dtype
+    )
+    batch_size = pred.size(0)
+
+    abs_diff = torch.abs(pred - target)
+    sq_diff = (pred - target) ** 2
+    full_l1 = abs_diff.mean(dim=(1, 2, 3))
+    full_mse = sq_diff.mean(dim=(1, 2, 3))
+
+    missing_count = mask.sum(dim=(1, 2, 3)).clamp(min=1.0)
+    missing_l1 = (abs_diff * mask).sum(dim=(1, 2, 3)) / missing_count
+    missing_mse = (sq_diff * mask).sum(dim=(1, 2, 3)) / missing_count
+    psnr_full = -10.0 * torch.log10(full_mse.clamp(min=1e-12))
+    psnr_missing = -10.0 * torch.log10(missing_mse.clamp(min=1e-12))
+
+    grad_pred = time_gradient(pred)
+    grad_target = time_gradient(target)
+    weight = F.max_pool2d(
+        mask[:, :1], kernel_size=(1, 5), stride=1, padding=(0, 2)
+    )
+    weight = weight[:, :, :, :grad_pred.size(-1)].clamp(0, 1)
+    boundary_count = weight.sum(dim=(1, 2, 3)).clamp(min=1.0)
+    boundary_l1 = (
+        torch.abs(grad_pred - grad_target) * weight
+    ).sum(dim=(1, 2, 3)) / boundary_count
+
+    known_error = None
+    if mel_corrupted is not None:
+        corrupted = torch.clamp(
+            _as_bchw(mel_corrupted).detach(), 0.0, 1.0
+        ).to(device=pred.device, dtype=pred.dtype)
+        known_mask = 1.0 - mask
+        known_error = (
+            torch.abs(pred - corrupted) * known_mask
+        ).flatten(1).max(dim=1).values
+
+    ssim_values = None
+    ssim_full_sum = None
+    if compute_ssim:
+        pred_np = pred.squeeze(1).cpu().numpy()
+        target_np = target.squeeze(1).cpu().numpy()
+        ssim_values = [
+            structural_similarity_2d(pred_np[index], target_np[index])
+            for index in range(batch_size)
+        ]
+        ssim_full_sum = float(np.sum(ssim_values))
+
+    per_sample = {
+        "mel_l1_full": full_l1.cpu().tolist(),
+        "mel_l1_missing": missing_l1.cpu().tolist(),
+        "psnr_full_db": psnr_full.cpu().tolist(),
+        "psnr_missing_db": psnr_missing.cpu().tolist(),
+        "boundary_l1": boundary_l1.cpu().tolist(),
+        "ssim_full": (
+            [None] * batch_size if ssim_values is None else ssim_values
+        ),
+    }
+    if known_error is not None:
+        per_sample["known_region_max_abs_error"] = known_error.cpu().tolist()
+
+    metrics = {
+        "num_samples": batch_size,
+        "psnr_full_sum": float(psnr_full.sum().cpu().item()),
+        "psnr_missing_sum": float(psnr_missing.sum().cpu().item()),
+        "mel_l1_full_sum": float(full_l1.sum().cpu().item()),
+        "mel_l1_missing_sum": float(missing_l1.sum().cpu().item()),
+        "ssim_full_sum": ssim_full_sum,
+        "boundary_l1_sum": float(boundary_l1.sum().cpu().item()),
+        "psnr_full_db": float(psnr_full.mean().cpu().item()),
+        "psnr_missing_db": float(psnr_missing.mean().cpu().item()),
+        "mel_l1_full": float(full_l1.mean().cpu().item()),
+        "mel_l1_missing": float(missing_l1.mean().cpu().item()),
+        "ssim_full": None if ssim_full_sum is None else ssim_full_sum / batch_size,
+        "boundary_l1": float(boundary_l1.mean().cpu().item()),
+        "per_sample": per_sample,
+    }
+    if known_error is not None:
+        metrics["known_region_max_abs_error_sum"] = float(
+            known_error.sum().cpu().item()
+        )
+        metrics["known_region_max_abs_error_mean"] = float(
+            known_error.mean().cpu().item()
+        )
+        metrics["known_region_max_abs_error_max"] = float(
+            known_error.max().cpu().item()
+        )
+    else:
+        metrics["known_region_max_abs_error_sum"] = None
+        metrics["known_region_max_abs_error_mean"] = None
+        metrics["known_region_max_abs_error_max"] = None
     return metrics
 
 

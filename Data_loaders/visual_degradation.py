@@ -12,6 +12,7 @@ VIDEO_CONDITIONS = (
     "temporal_shift",
     "wrong_video",
     "no_video",
+    "shuffled_video",
 )
 
 
@@ -53,6 +54,14 @@ def _shift_with_edge_padding(array, shift):
     return np.concatenate((array[amount:], padding), axis=0)
 
 
+def _frame_permutation(frame_count, rng):
+    permutation = list(range(int(frame_count)))
+    rng.shuffle(permutation)
+    if frame_count > 1 and permutation == list(range(int(frame_count))):
+        permutation = permutation[1:] + permutation[:1]
+    return permutation
+
+
 def apply_visual_degradation(
     video,
     flow,
@@ -84,6 +93,13 @@ def apply_visual_degradation(
     if condition == "no_video":
         video.fill(0.0)
         flow.fill(0.0)
+        return video, flow, parameters
+
+    if condition == "shuffled_video":
+        permutation = _frame_permutation(video.shape[0], rng)
+        video = video[permutation].copy()
+        flow = flow[permutation].copy()
+        parameters["frame_permutation"] = permutation
         return video, flow, parameters
 
     if condition == "blur":

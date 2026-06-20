@@ -64,8 +64,9 @@ class DiffusionSchedule:
     def __init__(self, timesteps=1000, beta_start=1e-4, beta_end=0.02,
                  schedule="linear"):
         self.timesteps = int(timesteps)
+        self.schedule = str(schedule)
 
-        if schedule == "cosine":
+        if self.schedule == "cosine":
             betas = cosine_beta_schedule(timesteps)
         else:
             betas = linear_beta_schedule(timesteps, beta_start, beta_end)
@@ -140,7 +141,8 @@ class DiffusionSchedule:
         return compose_known_region(z_t_noised, z_context, mask_z)
 
     def compute_previous_z(self, z_t, epsilon_pred, t,
-                           clamp_mask=None, z_context=None):
+                           clamp_mask=None, z_context=None,
+                           x0_clip_value=4.0):
         """DDPM posterior: compute z_{t-1}.
 
         Args:
@@ -161,7 +163,9 @@ class DiffusionSchedule:
         z_0_pred = (
             z_t - torch.sqrt(1.0 - alpha_bar_t) * epsilon_pred
         ) / torch.sqrt(alpha_bar_t)
-        z_0_pred = torch.clamp(z_0_pred, -4.0, 4.0)
+        if x0_clip_value is not None and float(x0_clip_value) > 0.0:
+            clip = float(x0_clip_value)
+            z_0_pred = torch.clamp(z_0_pred, -clip, clip)
 
         # Posterior mean coefficients
         sqrt_a_prev = torch.sqrt(
@@ -186,7 +190,7 @@ class DiffusionSchedule:
         return z_prev
 
     def ddim_step(self, z_t, epsilon_pred, t, t_next, eta=0.0,
-                  clamp_mask=None, z_context=None):
+                  clamp_mask=None, z_context=None, x0_clip_value=4.0):
         """Single DDIM step (Song et al. 2021).
 
         Args:
@@ -210,7 +214,9 @@ class DiffusionSchedule:
         z_0_pred = (
             z_t - torch.sqrt(1.0 - a_bar_t) * epsilon_pred
         ) / torch.sqrt(a_bar_t)
-        z_0_pred = torch.clamp(z_0_pred, -4.0, 4.0)
+        if x0_clip_value is not None and float(x0_clip_value) > 0.0:
+            clip = float(x0_clip_value)
+            z_0_pred = torch.clamp(z_0_pred, -clip, clip)
 
         # DDIM update
         sigma_term = (

@@ -827,10 +827,12 @@ PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \
   --data_root /root/shared-nvme/data \
   --test_split_name test_av_split.txt \
   --ae_checkpoint /root/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/mel_ae/MelAE_checkpoint_step000009950.pth.tar \
-  --resume_path /root/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/uq_av_k1/UQ-AV_checkpoint_step*.pth.tar \
+  --resume_path /root/Vision-Infused-Audio-Inpainter-VIAI/checkpoints/uq_av_k1/UQ-AV_checkpoint_step000040144.pth.tar \
+  --uq_unet_base_channels 128 \
   --batch_size 8 --num_workers 4 --display_id 0 \
   --results_dir checkpoints/uq_av_k1_test_results \
   --use_vocoder --vocoder_n_iter 32 --vocoder_max_samples 20
+
 
 # 8. No-video ablation (验证模型确实使用视觉条件)
 PYTHONPATH=/tmp/opencv_fix:$PYTHONPATH python main.py test-uq-av -- \

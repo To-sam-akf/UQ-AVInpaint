@@ -1,5 +1,6 @@
 import tempfile
 import unittest
+import random
 from pathlib import Path
 
 import cv2
@@ -7,7 +8,12 @@ import numpy as np
 import torch
 
 from Data_loaders.mask_sampler import MASK_TYPES
-from Data_loaders.uq_av_loader import UQAVDataset, create_uq_av_dataloader
+from Data_loaders.uq_av_loader import (
+    UQAVDataset,
+    create_uq_av_dataloader,
+    _normalise_condition_probabilities,
+    _sample_conditioning_mode,
+)
 from Data_loaders.visual_degradation import VIDEO_CONDITIONS
 from main import MODULE_MAP
 from tools.prepare_uq_metadata import parse_args, prepare_uq_metadata
@@ -195,6 +201,112 @@ class UQAVDataTests(unittest.TestCase):
         self.assertEqual(first[0]["mask_spec"], second[0]["mask_spec"])
         self.assertNotEqual(first_specs[0], first[0]["mask_spec"])
 
+    def test_modality_dropout_condition_sampling_is_deterministic(self):
+        probabilities = _normalise_condition_probabilities({
+            "audio_video": 0.4,
+            "drop_video": 0.2,
+            "partial_audio_video": 0.2,
+            "wrong_video": 0.1,
+            "shuffled_video": 0.1,
+        })
+        rng_a = random.Random(123)
+        rng_b = random.Random(123)
+        modes_a = [
+            _sample_conditioning_mode(rng_a, probabilities)
+            for _ in range(10000)
+        ]
+        modes_b = [
+            _sample_conditioning_mode(rng_b, probabilities)
+            for _ in range(10000)
+        ]
+        self.assertEqual(modes_a, modes_b)
+        counts = {mode: modes_a.count(mode) / len(modes_a) for mode in probabilities}
+        self.assertAlmostEqual(counts["audio_video"], 0.4, delta=0.03)
+        self.assertAlmostEqual(counts["drop_video"], 0.2, delta=0.03)
+        self.assertAlmostEqual(counts["partial_audio_video"], 0.2, delta=0.03)
+        self.assertAlmostEqual(counts["wrong_video"], 0.1, delta=0.03)
+        self.assertAlmostEqual(counts["shuffled_video"], 0.1, delta=0.03)
+
+    def test_partial_audio_changes_only_condition_context(self):
+        self._prepare_metadata(self.metadata_one)
+        base = UQAVDataset(
+            data_root=self.root,
+            split_name="train_av_split.txt",
+            phase="train",
+            metadata_dir=self.metadata_one,
+            seed=77,
+            image_size=8,
+            enable_modality_dropout=False,
+        )[0]
+        partial = UQAVDataset(
+            data_root=self.root,
+            split_name="train_av_split.txt",
+            phase="train",
+            metadata_dir=self.metadata_one,
+            seed=77,
+            image_size=8,
+            enable_modality_dropout=True,
+            condition_probabilities={
+                "audio_video": 0.0,
+                "drop_video": 0.0,
+                "partial_audio_video": 1.0,
+                "wrong_video": 0.0,
+                "shuffled_video": 0.0,
+            },
+        )[0]
+
+        self.assertEqual(partial["conditioning_mode"], "partial_audio_video")
+        self.assertTrue(torch.equal(base["mel_target"], partial["mel_target"]))
+        self.assertTrue(torch.equal(base["missing_mask"], partial["missing_mask"]))
+        self.assertTrue(torch.equal(base["boundary_map"], partial["boundary_map"]))
+        self.assertTrue(torch.equal(base["video"], partial["video"]))
+        self.assertFalse(
+            torch.equal(base["mel_corrupted"], partial["mel_corrupted"])
+        )
+        missing = partial["missing_mask"].bool()
+        self.assertTrue(torch.equal(
+            base["mel_corrupted"][missing],
+            partial["mel_corrupted"][missing],
+        ))
+
+    def test_eval_condition_override_drop_audio_is_reproducible(self):
+        self._prepare_metadata(self.metadata_one)
+        base = UQAVDataset(
+            data_root=self.root,
+            split_name="test_av_split.txt",
+            phase="test",
+            metadata_dir=self.metadata_one,
+            seed=77,
+            video_conditions=("original",),
+            image_size=8,
+        )[0]
+        first = UQAVDataset(
+            data_root=self.root,
+            split_name="test_av_split.txt",
+            phase="test",
+            metadata_dir=self.metadata_one,
+            seed=77,
+            video_conditions=("original",),
+            image_size=8,
+            condition_override="drop_audio",
+        )[0]
+        second = UQAVDataset(
+            data_root=self.root,
+            split_name="test_av_split.txt",
+            phase="test",
+            metadata_dir=self.metadata_one,
+            seed=77,
+            video_conditions=("original",),
+            image_size=8,
+            condition_override="drop_audio",
+        )[0]
+
+        self.assertEqual(first["conditioning_mode"], "drop_audio")
+        self.assertTrue(torch.equal(first["mel_corrupted"], second["mel_corrupted"]))
+        self.assertTrue(torch.equal(first["mel_target"], base["mel_target"]))
+        self.assertTrue(torch.equal(first["missing_mask"], base["missing_mask"]))
+        self.assertFalse(torch.equal(first["mel_corrupted"], base["mel_corrupted"]))
+
     def test_visual_degradations_are_reproducible_and_preserve_audio(self):
         self._prepare_metadata(self.metadata_one)
         original = self._dataset("original")[0]
@@ -214,6 +326,8 @@ class UQAVDataTests(unittest.TestCase):
             self.assertTrue(
                 torch.equal(first["audio_target"], original["audio_target"])
             )
+            self.assertTrue(torch.equal(first["missing_mask"], original["missing_mask"]))
+            self.assertTrue(torch.equal(first["boundary_map"], original["boundary_map"]))
 
         shifted = self._dataset("temporal_shift")[0]
         self.assertIn(
@@ -229,6 +343,86 @@ class UQAVDataTests(unittest.TestCase):
         no_video = self._dataset("no_video")[0]
         self.assertEqual(float(no_video["video"].abs().sum()), 0.0)
         self.assertEqual(float(no_video["flow"].abs().sum()), 0.0)
+        shuffled = self._dataset("shuffled_video")[0]
+        self.assertIn(
+            "frame_permutation",
+            shuffled["video_degradation"],
+        )
+        self.assertFalse(torch.equal(shuffled["video"], original["video"]))
+        self.assertEqual(
+            sorted(shuffled["video_degradation"]["frame_permutation"]),
+            list(range(50)),
+        )
+
+    def test_return_original_video_preserves_positive_condition(self):
+        self._prepare_metadata(self.metadata_one)
+        original = UQAVDataset(
+            data_root=self.root,
+            split_name="test_av_split.txt",
+            phase="test",
+            metadata_dir=self.metadata_one,
+            seed=77,
+            video_conditions=("original",),
+            image_size=8,
+            return_original_video=True,
+        )[0]
+        wrong = UQAVDataset(
+            data_root=self.root,
+            split_name="test_av_split.txt",
+            phase="test",
+            metadata_dir=self.metadata_one,
+            seed=77,
+            video_conditions=("wrong_video",),
+            image_size=8,
+            return_original_video=True,
+        )[0]
+        shuffled = UQAVDataset(
+            data_root=self.root,
+            split_name="test_av_split.txt",
+            phase="test",
+            metadata_dir=self.metadata_one,
+            seed=77,
+            video_conditions=("shuffled_video",),
+            image_size=8,
+            return_original_video=True,
+        )[0]
+
+        for sample in (wrong, shuffled):
+            self.assertTrue(torch.equal(sample["mel_target"], original["mel_target"]))
+            self.assertTrue(
+                torch.equal(sample["mel_corrupted"], original["mel_corrupted"])
+            )
+            self.assertTrue(
+                torch.equal(sample["missing_mask"], original["missing_mask"])
+            )
+            self.assertTrue(
+                torch.equal(sample["boundary_map"], original["boundary_map"])
+            )
+            self.assertTrue(
+                torch.equal(sample["audio_target"], original["audio_target"])
+            )
+            self.assertTrue(
+                torch.equal(sample["video_original"], original["video"])
+            )
+            self.assertTrue(torch.equal(sample["flow_original"], original["flow"]))
+            self.assertFalse(torch.equal(sample["video"], original["video"]))
+
+        loader = create_uq_av_dataloader(
+            data_root=self.root,
+            split_name="test_av_split.txt",
+            phase="test",
+            metadata_dir=self.metadata_one,
+            seed=77,
+            video_conditions=("wrong_video",),
+            image_size=8,
+            batch_size=2,
+            num_workers=0,
+            pin_memory=False,
+            return_original_video=True,
+        )
+        batch = next(iter(loader))
+        self.assertEqual(batch["video_original"].shape, (2, 50, 3, 8, 8))
+        self.assertEqual(batch["flow_original"].shape, (2, 50, 2, 8, 8))
 
 
 if __name__ == "__main__":

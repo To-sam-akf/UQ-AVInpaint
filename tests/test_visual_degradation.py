@@ -60,6 +60,28 @@ class VisualDegradationTests(unittest.TestCase):
         self.assertEqual(float(np.abs(flow_out).sum()), 0.0)
         self.assertEqual(params["condition"], "no_video")
 
+    def test_shuffled_video_uses_same_frame_permutation(self):
+        video_out, flow_out, params = apply_visual_degradation(
+            self.video.copy(), self.flow.copy(), "shuffled_video", seed=42
+        )
+        permutation = params["frame_permutation"]
+        self.assertEqual(sorted(permutation), list(range(self.frames)))
+        self.assertNotEqual(permutation, list(range(self.frames)))
+        self.assertTrue(np.allclose(video_out, self.video[permutation]))
+        self.assertTrue(np.allclose(flow_out, self.flow[permutation]))
+        self.assertEqual(params["condition"], "shuffled_video")
+
+    def test_shuffled_video_is_deterministic(self):
+        first = apply_visual_degradation(
+            self.video.copy(), self.flow.copy(), "shuffled_video", seed=123
+        )
+        second = apply_visual_degradation(
+            self.video.copy(), self.flow.copy(), "shuffled_video", seed=123
+        )
+        self.assertTrue(np.allclose(first[0], second[0]))
+        self.assertTrue(np.allclose(first[1], second[1]))
+        self.assertEqual(first[2], second[2])
+
     def test_blur_records_sigma(self):
         for iteration in range(10):
             video_out, flow_out, params = apply_visual_degradation(
@@ -173,6 +195,7 @@ class VisualDegradationTests(unittest.TestCase):
                 "temporal_shift",
                 "wrong_video",
                 "no_video",
+                "shuffled_video",
             },
         )
 

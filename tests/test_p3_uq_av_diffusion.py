@@ -14,6 +14,7 @@ Covers:
 """
 
 import importlib
+import math
 import os
 import sys
 from pathlib import Path
@@ -45,6 +46,7 @@ from networks.uq.video_evidence_encoder import (
     VideoConditionDummy,
 )
 from networks.uq.mel_autoencoder import MelAutoencoder
+from utils.viai_a_metrics import compute_inpainting_sample_metrics
 
 
 # ===================================================================
@@ -337,6 +339,33 @@ class TestKnownRegionClamp:
         assert known_error.item() == 0.0, \
             f"Known region not preserved after DDIM step: {known_error.item()}"
 
+    def test_configurable_x0_clip_preserves_known_region(self,
+                                                         diffusion_schedule,
+                                                         device):
+        diffusion_schedule.to_device(device)
+        z_context = torch.randn(2, 8, 10, 50, device=device)
+        mask_z = torch.zeros(2, 1, 10, 50, device=device)
+        mask_z[:, :, :, :12] = 1.0
+        z_t = compose_known_region(
+            torch.randn_like(z_context) * 10.0,
+            z_context,
+            mask_z,
+        )
+        t = torch.full((2,), 800, device=device).long()
+        t_next = torch.full((2,), 700, device=device).long()
+        epsilon_pred = torch.randn_like(z_t) * 10.0
+
+        for clip_value in (0.0, 1.0, 4.0):
+            z_next = diffusion_schedule.ddim_step(
+                z_t, epsilon_pred, t, t_next, eta=0.0,
+                clamp_mask=mask_z, z_context=z_context,
+                x0_clip_value=clip_value,
+            )
+            known_error = (
+                (z_next - z_context) * (1.0 - mask_z)
+            ).abs().max()
+            assert known_error.item() == 0.0
+
 
 # ===================================================================
 # U-Net shape tests
@@ -358,6 +387,66 @@ class TestLatentDiffusionUNet:
         assert out.shape == (B, 8, 10, 50), \
             f"Expected (B, 8, 10, 50), got {out.shape}"
 
+    def test_frame_positional_embedding_shape(self, device):
+        unet = LatentDiffusionUNet(
+            in_channels=19, out_channels=8, base_channels=32,
+            time_emb_dim=128, video_dim=128,
+        ).to(device)
+        tokens = torch.randn(2, 50, 128, device=device)
+
+        positioned = unet.apply_frame_positional_embedding(tokens)
+
+        assert unet.frame_pos_embed.shape == (1, 50, 128)
+        assert positioned.shape == tokens.shape
+        assert not torch.allclose(positioned, tokens)
+
+    def test_zero_tokens_do_not_receive_positional_embedding(self, device):
+        unet = LatentDiffusionUNet(
+            in_channels=19, out_channels=8, base_channels=32,
+            time_emb_dim=128, video_dim=128,
+        ).to(device)
+        tokens = torch.zeros(2, 50, 128, device=device)
+
+        positioned = unet.apply_frame_positional_embedding(tokens)
+
+        assert torch.equal(positioned, tokens)
+
+    def test_multi_level_attention_shape_and_count(self, device):
+        unet = LatentDiffusionUNet(
+            in_channels=19, out_channels=8, base_channels=32,
+            time_emb_dim=128, video_dim=128,
+        ).to(device)
+        B = 2
+        x = torch.randn(B, 19, 10, 50, device=device)
+        t = torch.randint(0, 1000, (B,), device=device).long()
+        video_tokens = torch.randn(B, 50, 128, device=device)
+
+        out = unet(x, t, video_tokens=video_tokens)
+
+        expected_attn_layers = (
+            len(unet.encoder_attns) + 1 + len(unet.decoder_attns)
+        )
+        assert expected_attn_layers == 8
+        assert out.shape == (B, 8, 10, 50)
+
+    def test_video_diagnostics_are_recorded(self, device):
+        unet = LatentDiffusionUNet(
+            in_channels=19, out_channels=8, base_channels=32,
+            time_emb_dim=128, video_dim=128,
+        ).to(device)
+        B = 2
+        x = torch.randn(B, 19, 10, 50, device=device)
+        t = torch.randint(0, 1000, (B,), device=device).long()
+        video_tokens = torch.randn(B, 50, 128, device=device)
+
+        _ = unet(x, t, video_tokens=video_tokens)
+
+        assert torch.isfinite(unet.video_gate_mean)
+        assert torch.isfinite(unet.video_attn_norm)
+        assert torch.isfinite(unet.video_token_norm)
+        assert unet.video_attn_norm.item() > 0.0
+        assert unet.video_token_norm.item() > 0.0
+
     def test_unet_without_video(self, device):
         """U-Net should work without video tokens (audio-only mode)."""
         unet = LatentDiffusionUNet(
@@ -370,6 +459,32 @@ class TestLatentDiffusionUNet:
 
         out = unet(x, t, video_tokens=None)
         assert out.shape == (B, 8, 10, 50)
+        assert unet.video_gate_mean.item() == 0.0
+        assert unet.video_attn_norm.item() == 0.0
+        assert unet.video_token_norm.item() == 0.0
+
+    def test_unet_output_changes_for_wrong_and_zero_video(self, device):
+        unet = LatentDiffusionUNet(
+            in_channels=19, out_channels=8, base_channels=32,
+            time_emb_dim=128, video_dim=128,
+        ).to(device)
+        unet.eval()
+        B = 2
+        x = torch.randn(B, 19, 10, 50, device=device)
+        t = torch.full((B,), 42, device=device).long()
+        original = torch.randn(B, 50, 128, device=device)
+        wrong = original.roll(shifts=1, dims=1)
+        zero = torch.zeros_like(original)
+
+        with torch.no_grad():
+            out_original = unet(x, t, video_tokens=original)
+            out_wrong = unet(x, t, video_tokens=wrong)
+            out_zero = unet(x, t, video_tokens=zero)
+
+        wrong_diff = (out_original - out_wrong).abs().mean().item()
+        zero_diff = (out_original - out_zero).abs().mean().item()
+        assert wrong_diff > 1e-7
+        assert zero_diff > 1e-7
 
     def test_unet_deterministic(self, device):
         """Same input should produce same output."""
@@ -549,6 +664,23 @@ class TestEndToEndSmoke:
             checkpoint_dir=str(tmpdir),
         )
 
+    def _make_batch(self, batch_size=2):
+        batch = {
+            "sample_id": [f"s{index}" for index in range(batch_size)],
+            "mel_target": torch.rand(batch_size, 1, 80, 200),
+            "mel_corrupted": torch.rand(batch_size, 1, 80, 200),
+            "missing_mask": torch.zeros(batch_size, 1, 80, 200),
+            "boundary_map": torch.zeros(batch_size, 2, 80, 200),
+            "video": torch.randn(batch_size, 50, 3, 64, 64),
+            "flow": torch.randn(batch_size, 50, 2, 64, 64),
+            "audio_target": torch.randn(batch_size, 64000),
+            "mask_spec": [None] * batch_size,
+            "video_condition": ["original"] * batch_size,
+            "video_degradation": [{} for _ in range(batch_size)],
+        }
+        batch["missing_mask"][:, :, :, 60:80] = 1.0
+        return batch
+
     def test_one_training_step(self, device, tmp_path):
         """Run one optimizer step and verify losses are finite."""
         hparams = self._make_hparams(tmp_path)
@@ -576,11 +708,210 @@ class TestEndToEndSmoke:
         model.set_input(batch)
         model.optimize_parameters(global_step=0)
         model.get_loss_items()
+        errors = model.get_current_errors()
 
         assert model.loss_total_item is not None
         assert not torch.isnan(torch.tensor(model.loss_total_item))
         assert not torch.isinf(torch.tensor(model.loss_total_item))
         assert model.loss_diff_item > 0
+        for key in ("video_gate_mean", "video_attn_norm", "video_token_norm"):
+            assert key in errors
+            assert math.isfinite(errors[key])
+
+    def test_condition_loss_logging_is_finite(self, device, tmp_path):
+        hparams = self._make_hparams(tmp_path)
+        model = UQAVDiffusionModel(hparams, device=device)
+
+        B = 2
+        batch = {
+            "sample_id": ["s1", "s2"],
+            "mel_target": torch.rand(B, 1, 80, 200),
+            "mel_corrupted": torch.rand(B, 1, 80, 200),
+            "missing_mask": torch.zeros(B, 1, 80, 200),
+            "boundary_map": torch.zeros(B, 2, 80, 200),
+            "video": torch.randn(B, 50, 3, 64, 64),
+            "flow": torch.randn(B, 50, 2, 64, 64),
+            "audio_target": torch.randn(B, 64000),
+            "mask_spec": [None, None],
+            "video_condition": ["original", "wrong_video"],
+            "conditioning_mode": ["drop_video", "wrong_video"],
+            "video_degradation": [{}, {}],
+        }
+        batch["missing_mask"][:, :, :, 60:80] = 1.0
+
+        model.set_input(batch)
+        model.optimize_parameters(global_step=0)
+        model.get_loss_items()
+
+        assert model.condition_counts["drop_video"] == 1
+        assert model.condition_counts["wrong_video"] == 1
+        for value in model.condition_loss_items.values():
+            assert math.isfinite(value)
+            assert value >= 0.0
+
+    def test_video_margin_loss_is_logged_and_in_total(self, device, tmp_path):
+        hparams = self._make_hparams(tmp_path)
+        hparams.uq_lambda_video_margin = 0.5
+        hparams.uq_video_margin = 0.02
+        hparams.uq_video_margin_negative = "batch_shuffle"
+        model = UQAVDiffusionModel(hparams, device=device)
+
+        B = 2
+        video_original = torch.randn(B, 50, 3, 64, 64)
+        flow_original = torch.randn(B, 50, 2, 64, 64)
+        batch = {
+            "sample_id": ["s1", "s2"],
+            "mel_target": torch.rand(B, 1, 80, 200),
+            "mel_corrupted": torch.rand(B, 1, 80, 200),
+            "missing_mask": torch.zeros(B, 1, 80, 200),
+            "boundary_map": torch.zeros(B, 2, 80, 200),
+            "video": video_original.roll(shifts=1, dims=0),
+            "flow": flow_original.roll(shifts=1, dims=0),
+            "video_original": video_original,
+            "flow_original": flow_original,
+            "audio_target": torch.randn(B, 64000),
+            "mask_spec": [None, None],
+            "video_condition": ["wrong_video", "wrong_video"],
+            "conditioning_mode": ["wrong_video", "wrong_video"],
+            "video_degradation": [{}, {}],
+        }
+        batch["missing_mask"][:, :, :, 60:80] = 1.0
+
+        model.set_input(batch)
+        model.optimize_parameters(global_step=0)
+        model.get_loss_items()
+        errors = model.get_current_errors()
+
+        assert math.isfinite(model.loss_video_margin_item)
+        assert model.loss_video_margin_item >= 0.0
+        assert math.isfinite(model.video_margin_l_original_item)
+        assert math.isfinite(model.video_margin_l_wrong_item)
+        assert model.video_margin_negative_mode == "batch_shuffle"
+        assert errors["loss_video_margin"] == model.loss_video_margin_item
+        assert errors["video_margin_negative_mode"] == "batch_shuffle"
+        expected = (
+            model.loss_diff_item
+            + hparams.uq_lambda_boundary * model.loss_boundary_item
+            + hparams.uq_lambda_video_margin * model.loss_video_margin_item
+        )
+        assert math.isclose(model.loss_total_item, expected, rel_tol=1e-5)
+
+    def test_distill_loss_is_logged_and_in_total(self, device, tmp_path):
+        hparams = self._make_hparams(tmp_path)
+        model = UQAVDiffusionModel(hparams, device=device)
+        model.lambda_distill = 0.25
+        batch = self._make_batch(batch_size=2)
+
+        def teacher_completed():
+            return torch.zeros_like(model.mel_target)
+
+        model._teacher_completed_mel = teacher_completed
+        model.set_input(batch)
+        model.optimize_parameters(global_step=0)
+        model.get_loss_items()
+        errors = model.get_current_errors()
+
+        assert math.isfinite(model.loss_distill_item)
+        assert model.loss_distill_item >= 0.0
+        assert errors["loss_distill"] == model.loss_distill_item
+        expected = (
+            model.loss_diff_item
+            + hparams.uq_lambda_boundary * model.loss_boundary_item
+            + model.lambda_distill * model.loss_distill_item
+        )
+        assert math.isclose(model.loss_total_item, expected, rel_tol=1e-5)
+
+    @pytest.mark.parametrize("prediction_type", ["epsilon", "x0", "v"])
+    def test_prediction_type_train_and_sample(self, prediction_type,
+                                              device, tmp_path):
+        hparams = self._make_hparams(tmp_path)
+        hparams.uq_prediction_type = prediction_type
+        model = UQAVDiffusionModel(hparams, device=device)
+        batch = self._make_batch(batch_size=1)
+
+        model.set_input(batch)
+        model.optimize_parameters(global_step=0)
+        model.get_loss_items()
+        assert math.isfinite(model.loss_total_item)
+
+        result = model.sample(
+            batch, num_candidates=1, inference_steps=2,
+            ddim_eta=0.0, seed=123,
+        )
+        assert result["completed_mels"].shape == (1, 1, 1, 80, 200)
+
+    def test_ema_updates_saves_loads_and_applies(self, device, tmp_path):
+        hparams = self._make_hparams(tmp_path)
+        hparams.uq_use_ema = True
+        hparams.uq_ema_decay = 0.5
+        hparams.uq_ema_start_step = 0
+        model = UQAVDiffusionModel(hparams, device=device)
+        batch = self._make_batch(batch_size=1)
+
+        model.set_input(batch)
+        model.optimize_parameters(global_step=1)
+        assert model.ema_state is not None
+
+        ckpt_path = model.save_checkpoint(
+            global_step=3,
+            global_epoch=1,
+            checkpoint_dir=str(tmp_path),
+        )
+        assert Path(str(ckpt_path).replace(".pth.tar", "_ema.pth.tar")).is_file()
+
+        eval_hparams = self._make_hparams(tmp_path)
+        eval_hparams.uq_ema_eval = True
+        eval_model = UQAVDiffusionModel(eval_hparams, device=device)
+        step, epoch = eval_model.load_checkpoint(
+            ckpt_path, reset_optimizer=True,
+        )
+        assert step == 3
+        assert epoch == 1
+        assert eval_model.ema_state is not None
+        eval_model.apply_ema_weights()
+
+    def test_require_latent_stats_raises_for_missing_stats(self, device, tmp_path):
+        hparams = self._make_hparams(tmp_path)
+        hparams.uq_require_latent_stats = True
+        model = UQAVDiffusionModel(hparams, device=device)
+        ae_path = Path(tmp_path) / "ae_no_stats.pth.tar"
+        torch.save(
+            {
+                "encoder": model.ae.encoder.state_dict(),
+                "decoder": model.ae.decoder.state_dict(),
+            },
+            ae_path,
+        )
+
+        with pytest.raises(RuntimeError, match="uq_require_latent_stats"):
+            model.load_ae_checkpoint(str(ae_path))
+
+    def test_drop_video_zeroes_tokens_without_no_video_flag(self, device, tmp_path):
+        hparams = self._make_hparams(tmp_path)
+        model = UQAVDiffusionModel(hparams, device=device)
+
+        B = 2
+        batch = {
+            "sample_id": ["s1", "s2"],
+            "mel_target": torch.rand(B, 1, 80, 200),
+            "mel_corrupted": torch.rand(B, 1, 80, 200),
+            "missing_mask": torch.zeros(B, 1, 80, 200),
+            "boundary_map": torch.zeros(B, 2, 80, 200),
+            "video": torch.randn(B, 50, 3, 64, 64),
+            "flow": torch.randn(B, 50, 2, 64, 64),
+            "audio_target": torch.randn(B, 64000),
+            "mask_spec": [None, None],
+            "video_condition": ["original", "original"],
+            "conditioning_mode": ["drop_video", "audio_video"],
+            "video_degradation": [{}, {}],
+        }
+        model.set_input(batch)
+        video_out = model.video_encoder(model.video, model.flow)
+        dropped = model._apply_video_conditioning_modes(video_out)
+
+        assert model.use_video
+        assert torch.count_nonzero(dropped["video_tokens"][0]).item() == 0
+        assert torch.count_nonzero(dropped["video_tokens"][1]).item() > 0
 
     def test_training_step_backprops_into_video_and_boundary(self, device, tmp_path):
         """Video encoder and boundary auxiliary loss must both train."""
@@ -704,6 +1035,22 @@ class TestEndToEndSmoke:
         assert result["uncertainty"] is None
         assert result["visual_evidence"] is None
 
+        metrics = compute_inpainting_sample_metrics(
+            result["completed_mels"][:, 0],
+            batch["mel_target"],
+            batch["missing_mask"],
+            mel_corrupted=batch["mel_corrupted"],
+            compute_ssim=False,
+        )
+        for key in (
+            "psnr_missing_db",
+            "mel_l1_missing",
+            "ssim_full",
+            "boundary_l1",
+            "known_region_max_abs_error_max",
+        ):
+            assert key in metrics
+
     def test_compose_known_region_is_strict(self, device, tmp_path):
         """After sampling, known Mel bins must be exactly preserved."""
 
@@ -815,6 +1162,87 @@ class TestEndToEndSmoke:
         assert hasattr(UQAVDiffusionModel, "optimize_parameters")
         assert hasattr(UQAVDiffusionModel, "sample")
         assert hasattr(UQAVDiffusionModel, "save_checkpoint")
+
+    def test_validation_sampling_options_parse(self):
+        from base_options import BaseOptions
+
+        opt = BaseOptions().parse(args=[
+            "--uq_val_inference_steps", "5",
+            "--uq_early_stop_patience", "10",
+            "--uq_early_stop_min_delta", "0.01",
+            "--uq_early_stop_metric", "val_sample_mel_l1_missing",
+            "--uq_disable_early_stop",
+        ])
+
+        assert opt.uq_val_inference_steps == 5
+        assert opt.uq_early_stop_patience == 10
+        assert opt.uq_early_stop_min_delta == 0.01
+        assert opt.uq_early_stop_metric == "val_sample_mel_l1_missing"
+        assert opt.uq_disable_early_stop
+
+        shuffled_opt = BaseOptions().parse(args=[
+            "--uq_video_degradation", "shuffled_video",
+        ])
+        assert shuffled_opt.uq_video_degradation == "shuffled_video"
+
+        p2_opt = BaseOptions().parse(args=[
+            "--uq_enable_modality_dropout",
+            "--uq_p_audio_video", "0.4",
+            "--uq_p_drop_video", "0.2",
+            "--uq_p_partial_audio_video", "0.2",
+            "--uq_p_wrong_video", "0.1",
+            "--uq_p_shuffled_video", "0.1",
+            "--uq_audio_context_drop_min_ratio", "0.15",
+            "--uq_audio_context_drop_max_ratio", "0.35",
+            "--uq_condition_override", "drop_audio",
+        ])
+        assert p2_opt.uq_enable_modality_dropout
+        assert p2_opt.uq_p_audio_video == 0.4
+        assert p2_opt.uq_p_drop_video == 0.2
+        assert p2_opt.uq_p_partial_audio_video == 0.2
+        assert p2_opt.uq_p_wrong_video == 0.1
+        assert p2_opt.uq_p_shuffled_video == 0.1
+        assert p2_opt.uq_audio_context_drop_min_ratio == 0.15
+        assert p2_opt.uq_audio_context_drop_max_ratio == 0.35
+        assert p2_opt.uq_condition_override == "drop_audio"
+
+        p3_opt = BaseOptions().parse(args=[
+            "--uq_lambda_video_margin", "0.1",
+            "--uq_video_margin", "0.02",
+            "--uq_video_margin_negative", "temporal_shuffle",
+        ])
+        assert p3_opt.uq_lambda_video_margin == 0.1
+        assert p3_opt.uq_video_margin == 0.02
+        assert p3_opt.uq_video_margin_negative == "temporal_shuffle"
+
+        p5_p6_opt = BaseOptions().parse(args=[
+            "--uq_teacher_type", "patchgan",
+            "--uq_teacher_checkpoint", "/tmp/teacher.pth.tar",
+            "--uq_teacher_ae_checkpoint", "/tmp/teacher_ae.pth.tar",
+            "--uq_lambda_distill", "0.25",
+            "--uq_teacher_inference_steps", "25",
+            "--uq_teacher_ddim_eta", "0.1",
+            "--uq_prediction_type", "v",
+            "--uq_latent_clip_value", "3.5",
+            "--uq_require_latent_stats",
+            "--uq_use_ema",
+            "--uq_ema_decay", "0.995",
+            "--uq_ema_start_step", "10",
+            "--uq_ema_eval",
+        ])
+        assert p5_p6_opt.uq_teacher_type == "patchgan"
+        assert p5_p6_opt.uq_teacher_checkpoint == "/tmp/teacher.pth.tar"
+        assert p5_p6_opt.uq_teacher_ae_checkpoint == "/tmp/teacher_ae.pth.tar"
+        assert p5_p6_opt.uq_lambda_distill == 0.25
+        assert p5_p6_opt.uq_teacher_inference_steps == 25
+        assert p5_p6_opt.uq_teacher_ddim_eta == 0.1
+        assert p5_p6_opt.uq_prediction_type == "v"
+        assert p5_p6_opt.uq_latent_clip_value == 3.5
+        assert p5_p6_opt.uq_require_latent_stats
+        assert p5_p6_opt.uq_use_ema
+        assert p5_p6_opt.uq_ema_decay == 0.995
+        assert p5_p6_opt.uq_ema_start_step == 10
+        assert p5_p6_opt.uq_ema_eval
 
 
 # ===================================================================

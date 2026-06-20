@@ -110,6 +110,49 @@ def mel_to_waveform(mel, hparams, backend="griffin_lim", n_iter=32):
     return _fix_waveform_length(wav, mel_amp.shape[1] * hop_size)
 
 
+def griffin_lim_mel_to_audio(mel, n_iter=32, n_fft=1280, hop_length=320,
+                              win_length=1280, sample_rate=16000,
+                              fmin=125.0, min_level_db=-100.0, ref_level_db=20.0):
+    """Standalone Griffin-Lim inversion: normalized mel -> waveform.
+
+    Args:
+        mel: [n_mels, time] normalized mel spectrogram in [0, 1]
+        n_iter: Griffin-Lim iterations
+        n_fft: FFT size
+        hop_length: hop length
+        win_length: window length
+        sample_rate: audio sample rate
+        fmin: minimum mel frequency
+        min_level_db: dB floor for amplitude conversion
+        ref_level_db: dB reference for amplitude conversion
+    Returns:
+        wav: np.float32 1-D waveform
+    """
+    mel = np.asarray(mel, dtype=np.float32)
+    if mel.ndim != 2:
+        raise ValueError("Expected a 2D Mel spectrogram.")
+
+    # Convert normalized mel [0,1] to amplitude
+    mel_db = np.clip(mel, 0.0, 1.0) * (-min_level_db) + min_level_db
+    mel_amp = np.power(10.0, (mel_db + ref_level_db) * 0.05).astype(np.float32)
+
+    fmax = float(sample_rate / 2.0)
+    wav = librosa.feature.inverse.mel_to_audio(
+        mel_amp,
+        sr=int(sample_rate),
+        n_fft=int(n_fft),
+        hop_length=int(hop_length),
+        win_length=int(win_length),
+        fmin=float(fmin),
+        fmax=fmax,
+        power=1.0,
+        n_iter=int(n_iter),
+        center=False,
+        dtype=np.float32,
+    )
+    return _fix_waveform_length(wav, mel_amp.shape[1] * int(hop_length))
+
+
 def save_waveform(path, wav, sample_rate, normalize=True):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     if normalize:

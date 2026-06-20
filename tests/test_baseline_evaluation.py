@@ -12,6 +12,7 @@ from utils.baseline_evaluation import (
     compute_sample_records,
     select_prediction,
 )
+from utils.viai_a_metrics import compute_inpainting_sample_metrics
 
 
 class BaselineEvaluationTests(unittest.TestCase):
@@ -104,6 +105,64 @@ class BaselineEvaluationTests(unittest.TestCase):
         summary = aggregate_sample_records(records)
         self.assertAlmostEqual(summary["mel_l1_full"], 4.0)
         self.assertAlmostEqual(summary["known_region_max_abs_error"], 0.08)
+
+    def test_sampling_metrics_perfect_prediction(self):
+        target = torch.full((1, 1, 8, 12), 0.5)
+        mask = torch.zeros_like(target)
+        mask[:, :, :, 4:8] = 1.0
+
+        metrics = compute_inpainting_sample_metrics(
+            target,
+            target,
+            mask,
+            mel_corrupted=target,
+            compute_ssim=False,
+        )
+
+        self.assertAlmostEqual(metrics["mel_l1_missing"], 0.0)
+        self.assertAlmostEqual(metrics["boundary_l1"], 0.0)
+        self.assertAlmostEqual(metrics["known_region_max_abs_error_max"], 0.0)
+        self.assertAlmostEqual(metrics["psnr_missing_db"], 120.0, places=4)
+
+    def test_sampling_metrics_missing_l1_and_psnr_scale(self):
+        target = torch.zeros(1, 1, 8, 12)
+        pred = target.clone()
+        pred[:, :, :, 4:8] = 0.5
+        mask = torch.zeros_like(target)
+        mask[:, :, :, 4:8] = 1.0
+
+        metrics = compute_inpainting_sample_metrics(
+            pred,
+            target,
+            mask,
+            compute_ssim=False,
+        )
+
+        self.assertAlmostEqual(metrics["mel_l1_missing"], 0.5)
+        self.assertAlmostEqual(metrics["psnr_missing_db"], 6.0206, places=3)
+
+    def test_sampling_metrics_boundary_and_known_region_error(self):
+        target = torch.zeros(1, 1, 8, 12)
+        target[:, :, :, 6:] = 1.0
+        pred = torch.zeros_like(target)
+        corrupted = pred.clone()
+        corrupted[:, :, :, :4] = 0.25
+        pred[:, :, :, :4] = 0.5
+        mask = torch.zeros_like(target)
+        mask[:, :, :, 4:8] = 1.0
+
+        metrics = compute_inpainting_sample_metrics(
+            pred,
+            target,
+            mask,
+            mel_corrupted=corrupted,
+            compute_ssim=False,
+        )
+
+        self.assertGreater(metrics["boundary_l1"], 0.0)
+        self.assertAlmostEqual(
+            metrics["known_region_max_abs_error_max"], 0.25,
+        )
 
 
 if __name__ == "__main__":

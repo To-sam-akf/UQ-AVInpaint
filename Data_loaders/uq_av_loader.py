@@ -23,6 +23,24 @@ from Data_loaders.visual_degradation import (
 from utils.baseline_protocol import canonical_sample_id
 
 
+CONDITIONING_MODES = (
+    "audio_video",
+    "drop_video",
+    "partial_audio_video",
+    "wrong_video",
+    "shuffled_video",
+    "drop_audio",
+)
+
+TRAIN_CONDITIONING_MODES = (
+    "audio_video",
+    "drop_video",
+    "partial_audio_video",
+    "wrong_video",
+    "shuffled_video",
+)
+
+
 def _resolve_data_path(data_root, value):
     path = Path(value)
     if path.is_absolute():
@@ -78,6 +96,94 @@ def read_uq_split(data_root, split_name):
     return rows
 
 
+def _normalise_condition_probabilities(probabilities):
+    values = {
+        "audio_video": float(probabilities.get("audio_video", 0.0)),
+        "drop_video": float(probabilities.get("drop_video", 0.0)),
+        "partial_audio_video": float(
+            probabilities.get("partial_audio_video", 0.0)
+        ),
+        "wrong_video": float(probabilities.get("wrong_video", 0.0)),
+        "shuffled_video": float(probabilities.get("shuffled_video", 0.0)),
+    }
+    if any(value < 0.0 for value in values.values()):
+        raise ValueError(f"Condition probabilities must be >= 0: {values}")
+    total = sum(values.values())
+    if total <= 0.0:
+        raise ValueError("At least one UQ conditioning probability must be > 0")
+    return {key: value / total for key, value in values.items()}
+
+
+def _sample_conditioning_mode(rng, probabilities):
+    threshold = rng.random()
+    cumulative = 0.0
+    for mode in TRAIN_CONDITIONING_MODES:
+        cumulative += probabilities[mode]
+        if threshold <= cumulative:
+            return mode
+    return TRAIN_CONDITIONING_MODES[-1]
+
+
+def video_condition_for_conditioning_mode(mode):
+    if mode == "wrong_video":
+        return "wrong_video"
+    if mode == "shuffled_video":
+        return "shuffled_video"
+    return "original"
+
+
+def apply_audio_context_dropout_tensor(
+    mel_corrupted,
+    missing_mask,
+    seed,
+    min_ratio=0.15,
+    max_ratio=0.35,
+):
+    """Hide an extra known-context time span without changing the true mask."""
+    if max_ratio < min_ratio:
+        raise ValueError(
+            "uq_audio_context_drop_max_ratio must be >= "
+            "uq_audio_context_drop_min_ratio"
+        )
+
+    output = mel_corrupted.clone()
+    batch_size = int(output.size(0))
+    frames = int(output.size(-1))
+    for batch_index in range(batch_size):
+        rng = random.Random(stable_seed(
+            "uq-audio-context-drop",
+            int(seed),
+            batch_index,
+        ))
+        ratio = rng.uniform(float(min_ratio), float(max_ratio))
+        requested = max(1, int(round(frames * ratio)))
+        sample_mask = missing_mask[batch_index].detach().cpu()
+        while sample_mask.ndim > 2:
+            sample_mask = sample_mask.amax(dim=0)
+        missing_time = (sample_mask.amax(dim=0) > 0.0).tolist()
+
+        segments = []
+        start = None
+        for frame_index, is_missing in enumerate(missing_time + [True]):
+            if not is_missing and start is None:
+                start = frame_index
+            elif is_missing and start is not None:
+                if frame_index > start:
+                    segments.append((start, frame_index))
+                start = None
+        if not segments:
+            continue
+
+        weights = [end - start for start, end in segments]
+        chosen = rng.choices(segments, weights=weights, k=1)[0]
+        seg_start, seg_end = chosen
+        drop_len = min(requested, seg_end - seg_start)
+        drop_start = rng.randint(seg_start, seg_end - drop_len)
+        drop_end = drop_start + drop_len
+        output[batch_index, :, :, drop_start:drop_end] = 0.0
+    return output
+
+
 class UQAVDataset(Dataset):
     def __init__(
         self,
@@ -95,6 +201,12 @@ class UQAVDataset(Dataset):
         visual_frames=50,
         image_size=256,
         boundary_margin=3,
+        enable_modality_dropout=False,
+        condition_probabilities=None,
+        audio_context_drop_min_ratio=0.15,
+        audio_context_drop_max_ratio=0.35,
+        condition_override="none",
+        return_original_video=False,
     ):
         if phase not in {"train", "val", "test"}:
             raise ValueError(f"Unsupported UQ data phase: {phase}")
@@ -109,6 +221,24 @@ class UQAVDataset(Dataset):
         self.visual_frames = int(visual_frames)
         self.image_size = int(image_size)
         self.boundary_margin = int(boundary_margin)
+        self.enable_modality_dropout = bool(enable_modality_dropout)
+        self.condition_probabilities = _normalise_condition_probabilities(
+            condition_probabilities or {
+                "audio_video": 0.4,
+                "drop_video": 0.2,
+                "partial_audio_video": 0.2,
+                "wrong_video": 0.1,
+                "shuffled_video": 0.1,
+            }
+        )
+        self.audio_context_drop_min_ratio = float(audio_context_drop_min_ratio)
+        self.audio_context_drop_max_ratio = float(audio_context_drop_max_ratio)
+        self.condition_override = str(condition_override or "none")
+        self.return_original_video = bool(return_original_video)
+        if self.condition_override not in {"none", "drop_video", "drop_audio"}:
+            raise ValueError(
+                f"Unsupported UQ condition override: {self.condition_override}"
+            )
         self.rows = read_uq_split(self.data_root, split_name)
         self.row_by_sample_id = {row["sample_id"]: row for row in self.rows}
         if len(self.row_by_sample_id) != len(self.rows):
@@ -279,7 +409,16 @@ class UQAVDataset(Dataset):
         )
         rng = random.Random(selection_seed)
         mask_type = rng.choice(self.mask_types)
-        condition = rng.choice(self.video_conditions)
+        if self.enable_modality_dropout:
+            conditioning_mode = _sample_conditioning_mode(
+                rng, self.condition_probabilities,
+            )
+            condition = video_condition_for_conditioning_mode(
+                conditioning_mode
+            )
+        else:
+            condition = rng.choice(self.video_conditions)
+            conditioning_mode = "audio_video"
         mask_seed = stable_seed(
             "uq-train-mask",
             self.seed,
@@ -289,7 +428,14 @@ class UQAVDataset(Dataset):
         )
         onsets = self._load_onsets(row) if mask_type == "onset_centered" else None
         spec = self.mask_sampler.sample(mask_type, mask_seed, onset_strengths=onsets)
-        return spec, condition
+        return spec, condition, conditioning_mode
+
+    def _conditioning_mode_for_eval_condition(self, condition):
+        if self.condition_override == "drop_video":
+            return "drop_video"
+        if self.condition_override == "drop_audio":
+            return "drop_audio"
+        return "audio_video"
 
     def _wrong_video_row(self, row_index, visual_seed):
         row = self.rows[row_index]
@@ -317,10 +463,15 @@ class UQAVDataset(Dataset):
         if self.phase == "train":
             row_index = int(index)
             row = self.rows[row_index]
-            spec, condition = self._training_spec_and_condition(row)
+            spec, condition, conditioning_mode = (
+                self._training_spec_and_condition(row)
+            )
         else:
             row_index, spec, condition = self.eval_entries[int(index)]
             row = self.rows[row_index]
+            conditioning_mode = self._conditioning_mode_for_eval_condition(
+                condition
+            )
 
         mel_target, audio_target = self._load_mel_audio(row)
         mel_corrupted, missing_mask = corrupt_mel(
@@ -328,6 +479,25 @@ class UQAVDataset(Dataset):
             spec,
             boundary_margin=self.boundary_margin,
         )
+        if conditioning_mode in {"partial_audio_video", "drop_audio"}:
+            audio_drop_seed = stable_seed(
+                "uq-audio-context-drop-dataset",
+                self.seed,
+                self.epoch if self.phase == "train" else 0,
+                row["sample_id"],
+                spec.mask_type,
+                spec.start,
+                spec.end,
+                conditioning_mode,
+                condition,
+            )
+            mel_corrupted = apply_audio_context_dropout_tensor(
+                mel_corrupted.unsqueeze(0),
+                missing_mask.unsqueeze(0),
+                audio_drop_seed,
+                min_ratio=self.audio_context_drop_min_ratio,
+                max_ratio=self.audio_context_drop_max_ratio,
+            ).squeeze(0)
         boundary_map = build_boundary_map(
             spec,
             mel_bins=self.mel_bins,
@@ -335,7 +505,9 @@ class UQAVDataset(Dataset):
             dtype=mel_target.dtype,
         )
 
-        video, flow = self._load_visual(row)
+        video_original, flow_original = self._load_visual(row)
+        video = video_original
+        flow = flow_original
         visual_seed = stable_seed(
             "uq-visual",
             self.seed,
@@ -363,7 +535,7 @@ class UQAVDataset(Dataset):
             **degradation_kwargs,
         )
 
-        return {
+        sample = {
             "sample_id": row["sample_id"],
             "mel_target": mel_target,
             "mel_corrupted": mel_corrupted,
@@ -374,8 +546,17 @@ class UQAVDataset(Dataset):
             "audio_target": audio_target,
             "mask_spec": spec,
             "video_condition": condition,
+            "conditioning_mode": conditioning_mode,
             "video_degradation": degradation,
         }
+        if self.return_original_video:
+            sample["video_original"] = torch.from_numpy(
+                np.ascontiguousarray(video_original)
+            )
+            sample["flow_original"] = torch.from_numpy(
+                np.ascontiguousarray(flow_original)
+            )
+        return sample
 
 
 def uq_av_collate_fn(batch):
@@ -390,6 +571,8 @@ def uq_av_collate_fn(batch):
         "flow",
         "audio_target",
     )
+    if "video_original" in batch[0]:
+        tensor_fields = tensor_fields + ("video_original", "flow_original")
     output = {
         field: torch.stack([sample[field] for sample in batch], dim=0)
         for field in tensor_fields
@@ -398,6 +581,7 @@ def uq_av_collate_fn(batch):
         "sample_id",
         "mask_spec",
         "video_condition",
+        "conditioning_mode",
         "video_degradation",
     ):
         output[field] = [sample[field] for sample in batch]

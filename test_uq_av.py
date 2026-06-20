@@ -20,21 +20,16 @@ import os
 import sys
 import time
 
-import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
-import torch.nn.functional as F
 from tqdm import tqdm
 
 import Options_inpainting
 from Data_loaders.uq_av_loader import get_uq_av_data_loaders
 from Models.UQ_AV_Diffusion import UQAVDiffusionModel
-from networks.uq.mel_autoencoder import time_gradient
 from utils.viai_a_metrics import (
-    compute_viai_a_metrics,
-    compose_inpainted_mel,
+    compute_inpainting_sample_metrics,
     save_mel_comparison_batch,
-    structural_similarity_2d,
 )
 
 # ---------------------------------------------------------------------------
@@ -68,6 +63,22 @@ def _uq_dataset_kwargs():
         "video_conditions": (getattr(hparams, "uq_video_degradation", "original"),),
         "image_size": getattr(hparams, "image_size", 256),
         "seed": getattr(hparams, "eval_seed", 1234),
+        "condition_probabilities": {
+            "audio_video": getattr(hparams, "uq_p_audio_video", 0.4),
+            "drop_video": getattr(hparams, "uq_p_drop_video", 0.2),
+            "partial_audio_video": getattr(
+                hparams, "uq_p_partial_audio_video", 0.2,
+            ),
+            "wrong_video": getattr(hparams, "uq_p_wrong_video", 0.1),
+            "shuffled_video": getattr(hparams, "uq_p_shuffled_video", 0.1),
+        },
+        "audio_context_drop_min_ratio": getattr(
+            hparams, "uq_audio_context_drop_min_ratio", 0.15,
+        ),
+        "audio_context_drop_max_ratio": getattr(
+            hparams, "uq_audio_context_drop_max_ratio", 0.35,
+        ),
+        "condition_override": getattr(hparams, "uq_condition_override", "none"),
     }
     metadata_dir = getattr(hparams, "uq_metadata_dir", None)
     if metadata_dir:
@@ -75,53 +86,17 @@ def _uq_dataset_kwargs():
     return kwargs
 
 
-def _per_sample_metrics(mel_completed, mel_target, missing_mask, mel_corrupted):
-    pred = torch.clamp(mel_completed.detach(), 0.0, 1.0)
-    target = torch.clamp(mel_target.detach(), 0.0, 1.0)
-    mask = missing_mask.detach().to(device=pred.device, dtype=pred.dtype)
-    known_mask = 1.0 - mask
+def _sample_seed(batch_index):
+    seed = getattr(hparams, "eval_seed", None)
+    if seed is None:
+        return None
+    return int(seed) + int(batch_index)
 
-    abs_diff = torch.abs(pred - target)
-    sq_diff = (pred - target) ** 2
-    full_l1 = abs_diff.mean(dim=(1, 2, 3))
-    full_mse = sq_diff.mean(dim=(1, 2, 3))
 
-    missing_count = mask.sum(dim=(1, 2, 3)).clamp(min=1.0)
-    missing_l1 = (abs_diff * mask).sum(dim=(1, 2, 3)) / missing_count
-    missing_mse = (sq_diff * mask).sum(dim=(1, 2, 3)) / missing_count
-    psnr_full = -10.0 * torch.log10(full_mse.clamp(min=1e-12))
-    psnr_missing = -10.0 * torch.log10(missing_mse.clamp(min=1e-12))
-
-    known_error = (
-        torch.abs(pred - mel_corrupted.detach()) * known_mask
-    ).flatten(1).max(dim=1).values
-
-    grad_pred = time_gradient(pred)
-    grad_target = time_gradient(target)
-    weight = F.max_pool2d(mask[:, :1], kernel_size=(1, 5),
-                          stride=1, padding=(0, 2))
-    weight = weight[:, :, :, :grad_pred.size(-1)].clamp(0, 1)
-    boundary_count = weight.sum(dim=(1, 2, 3)).clamp(min=1.0)
-    boundary_l1 = (
-        torch.abs(grad_pred - grad_target) * weight
-    ).sum(dim=(1, 2, 3)) / boundary_count
-
-    pred_np = pred.squeeze(1).cpu().numpy()
-    target_np = target.squeeze(1).cpu().numpy()
-    ssim = [
-        structural_similarity_2d(pred_np[index], target_np[index])
-        for index in range(pred.size(0))
-    ]
-
-    return {
-        "mel_l1_full": full_l1.cpu().tolist(),
-        "mel_l1_missing": missing_l1.cpu().tolist(),
-        "psnr_full_db": psnr_full.cpu().tolist(),
-        "psnr_missing_db": psnr_missing.cpu().tolist(),
-        "boundary_l1": boundary_l1.cpu().tolist(),
-        "known_region_max_abs_error": known_error.cpu().tolist(),
-        "ssim_full": ssim,
-    }
+def _video_ablation_condition():
+    if bool(getattr(hparams, "uq_no_video", False)):
+        return "zero_token"
+    return str(getattr(hparams, "uq_video_degradation", "original"))
 
 
 def _vocoder_export(mel_completed, mel_target, sample_ids,
@@ -230,6 +205,7 @@ def main():
     sample_count = 0
     ssim_sample_count = 0
 
+    eval_start = time.perf_counter()
     progress = tqdm(data_loader, desc="[UQ-AV test]", unit="batch",
                     dynamic_ncols=True)
     for batch_idx, batch in enumerate(progress):
@@ -238,34 +214,32 @@ def main():
             batch, num_candidates=num_candidates,
             inference_steps=inference_steps,
             ddim_eta=ddim_eta,
+            seed=_sample_seed(batch_idx),
         )
 
         mel_completed = result["completed_mels"][:, 0]  # [B, 1, 80, 200]
-        mel_pred = result["candidate_mels"][:, 0]
 
-        # Compute metrics
-        metrics = compute_viai_a_metrics(
-            mel_completed, model.mel_target, model.missing_mask,
-            compute_ssim=True,
-        )
-        sample_metrics = _per_sample_metrics(
+        # Compute metrics with the same helper used by validation sampling.
+        metrics = compute_inpainting_sample_metrics(
             mel_completed,
             model.mel_target,
             model.missing_mask,
             model.mel_corrupted,
+            compute_ssim=True,
         )
+        sample_metrics = metrics["per_sample"]
         total["psnr_full_sum"] += metrics["psnr_full_sum"]
         total["psnr_missing_sum"] += metrics["psnr_missing_sum"]
-        total["mel_l1_full_sum"] += sum(sample_metrics["mel_l1_full"])
-        total["mel_l1_missing_sum"] += sum(sample_metrics["mel_l1_missing"])
-        total["known_max_abs_err_sum"] += sum(
-            sample_metrics["known_region_max_abs_error"]
+        total["mel_l1_full_sum"] += metrics["mel_l1_full_sum"]
+        total["mel_l1_missing_sum"] += metrics["mel_l1_missing_sum"]
+        total["known_max_abs_err_sum"] += (
+            metrics["known_region_max_abs_error_sum"] or 0.0
         )
         total["known_max_abs_err_max"] = max(
             total["known_max_abs_err_max"],
-            max(sample_metrics["known_region_max_abs_error"]),
+            metrics["known_region_max_abs_error_max"] or 0.0,
         )
-        total["boundary_l1_sum"] += sum(sample_metrics["boundary_l1"])
+        total["boundary_l1_sum"] += metrics["boundary_l1_sum"]
         sample_count += metrics["num_samples"]
         if metrics.get("ssim_full_sum") is not None:
             total["ssim_full_sum"] += metrics["ssim_full_sum"]
@@ -288,6 +262,11 @@ def main():
                 if i < len(model.video_conditions)
                 else "unknown"
             )
+            conditioning_mode = (
+                model.conditioning_modes[i]
+                if i < len(model.conditioning_modes)
+                else "audio_video"
+            )
             record = {
                 "sample_id": str(sid),
                 "mask_type": getattr(spec, "mask_type", "unknown"),
@@ -295,6 +274,7 @@ def main():
                 "end": int(getattr(spec, "end", -1)),
                 "gap_frames": int(getattr(spec, "gap_frames", -1)),
                 "video_condition": str(cond),
+                "conditioning_mode": str(conditioning_mode),
                 "mel_l1_full": float(sample_metrics["mel_l1_full"][i]),
                 "mel_l1_missing": float(sample_metrics["mel_l1_missing"][i]),
                 "psnr_full_db": float(sample_metrics["psnr_full_db"][i]),
@@ -327,6 +307,7 @@ def main():
             )
 
     # ---- Summary ----
+    elapsed_seconds = time.perf_counter() - eval_start
     n = max(1, sample_count)
     ns = max(1, ssim_sample_count)
     summary = {
@@ -342,9 +323,28 @@ def main():
         "known_region_max_abs_error_mean": total["known_max_abs_err_sum"] / n,
         "known_region_max_abs_error_max": total["known_max_abs_err_max"],
         "video_degradation": getattr(hparams, "uq_video_degradation", "original"),
+        "eval_seed": getattr(hparams, "eval_seed", None),
+        "uq_no_video": bool(getattr(hparams, "uq_no_video", False)),
+        "uq_condition_override": getattr(
+            hparams, "uq_condition_override", "none",
+        ),
+        "video_ablation_condition": _video_ablation_condition(),
         "inference_steps": inference_steps,
         "ddim_eta": ddim_eta,
         "num_candidates": num_candidates,
+        "uq_beta_schedule": getattr(hparams, "uq_beta_schedule", "linear"),
+        "uq_prediction_type": getattr(
+            hparams, "uq_prediction_type", "epsilon",
+        ),
+        "uq_latent_clip_value": getattr(
+            hparams, "uq_latent_clip_value", 4.0,
+        ),
+        "latent_is_normalised": bool(model.latent_is_normalised),
+        "uq_use_ema": bool(getattr(hparams, "uq_use_ema", False)),
+        "uq_ema_eval": bool(getattr(hparams, "uq_ema_eval", False)),
+        "elapsed_seconds": elapsed_seconds,
+        "seconds_per_sample": elapsed_seconds / n,
+        "samples_per_second": sample_count / max(elapsed_seconds, 1e-12),
     }
 
     # Write summary.json
@@ -385,6 +385,7 @@ def main():
                 batch, num_candidates=num_candidates,
                 inference_steps=inference_steps,
                 ddim_eta=ddim_eta,
+                seed=_sample_seed(exported // max(1, hparams.batch_size)),
             )
             mel_completed = result["completed_mels"][:, 0]
             _vocoder_export(

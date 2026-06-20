@@ -1,4 +1,4 @@
-"""Conditional U-Net for latent-space Mel inpainting (P3).
+"""Conditional U-Net for latent-space Mel inpainting (P4).
 
 Operates on latent space [B, C=8, H=10, W=50] produced by the frozen Mel AE.
 
@@ -7,7 +7,7 @@ Output: 8 channels = epsilon prediction
 
 Conditioning:
   - Time embedding: sinusoidal → MLP → injected via FiLM in each residual block.
-  - Video tokens: cross-attention at the bottleneck.
+  - Video tokens: frame positional embedding + gated multi-level cross-attention.
 
 Architecture follows a standard 2D U-Net with residual blocks and skip connections.
 """
@@ -201,6 +201,28 @@ class CrossAttention2D(nn.Module):
         return out.transpose(1, 2).view(B, C, H, W)
 
 
+class GatedCrossAttention2D(nn.Module):
+    """Residual gated video cross-attention for a 2D feature map."""
+
+    def __init__(self, query_dim, kv_dim, num_heads=4, dropout=0.0):
+        super().__init__()
+        self.attn = CrossAttention2D(
+            query_dim=query_dim,
+            kv_dim=kv_dim,
+            num_heads=num_heads,
+            dropout=dropout,
+        )
+        self.gate = nn.Parameter(torch.zeros(1))
+
+    def forward(self, x_spatial, video_tokens):
+        attn_out = self.attn(x_spatial, video_tokens)
+        gate = torch.sigmoid(self.gate)
+        return x_spatial + gate * attn_out, {
+            "gate": gate.detach().mean(),
+            "attn_norm": attn_out.detach().pow(2).mean().sqrt(),
+        }
+
+
 # ---------------------------------------------------------------------------
 # Downsample / Upsample helpers
 # ---------------------------------------------------------------------------
@@ -257,6 +279,8 @@ class LatentDiffusionUNet(nn.Module):
         norm_type:     "batch" or "instance"
     """
 
+    max_video_frames = 50
+
     def __init__(
         self,
         in_channels=19,
@@ -267,18 +291,25 @@ class LatentDiffusionUNet(nn.Module):
         video_dim=256,
         num_heads=4,
         norm_type="batch",
-        attn_resolutions=(3, 7),  # spatial size where cross-attn is applied
+        attn_resolutions=None,  # kept for checkpoint/config compatibility
     ):
         super().__init__()
         self.base_channels = base_channels
         self.out_channels = out_channels
         self.time_emb_dim = time_emb_dim
+        self.video_dim = video_dim
+        self.num_heads = num_heads
+
+        self.frame_pos_embed = nn.Parameter(
+            torch.zeros(1, self.max_video_frames, video_dim)
+        )
 
         # Time embedding
         self.time_embed = TimeEmbedding(time_emb_dim)
 
         # Encoder stages — store (channels, spatial_size) per level
         self.encoder_blocks = nn.ModuleList()
+        self.encoder_attns = nn.ModuleList()
         ch = base_channels
         prev_ch = in_channels
 
@@ -296,6 +327,11 @@ class LatentDiffusionUNet(nn.Module):
                 ResBlock2D(prev_ch, out_ch, time_emb_dim=time_emb_dim,
                            stride=stride_hw, norm_type=norm_type)
             )
+            self.encoder_attns.append(
+                GatedCrossAttention2D(
+                    query_dim=out_ch, kv_dim=video_dim, num_heads=num_heads,
+                )
+            )
             cur_h = (cur_h - 1) // stride_hw[0] + 1
             cur_w = (cur_w - 1) // stride_hw[1] + 1
             encoder_channels.append(out_ch)
@@ -310,13 +346,14 @@ class LatentDiffusionUNet(nn.Module):
         bottleneck_spatial = (cur_h, cur_w)
 
         # Cross-attention at bottleneck
-        self.cross_attn = CrossAttention2D(
+        self.bottleneck_attn = GatedCrossAttention2D(
             query_dim=prev_ch, kv_dim=video_dim, num_heads=num_heads,
         )
 
         # Decoder stages — use interpolation + conv upsample
         self.decoder_upsamples = nn.ModuleList()
         self.decoder_resblocks = nn.ModuleList()
+        self.decoder_attns = nn.ModuleList()
         self.decoder_target_sizes = []  # (H, W) per decoder level
 
         rev_mult = list(reversed(channel_mult))
@@ -333,6 +370,11 @@ class LatentDiffusionUNet(nn.Module):
                     stride=1, norm_type=norm_type,
                 )
             )
+            self.decoder_attns.append(
+                GatedCrossAttention2D(
+                    query_dim=out_ch, kv_dim=video_dim, num_heads=num_heads,
+                )
+            )
             self.decoder_target_sizes.append((target_h, target_w))
             prev_ch = out_ch
 
@@ -343,6 +385,8 @@ class LatentDiffusionUNet(nn.Module):
         )
 
         self._init_weights()
+        nn.init.normal_(self.frame_pos_embed, mean=0.0, std=0.02)
+        self._reset_video_diagnostics(device=None)
 
     def _init_weights(self):
         for m in self.modules():
@@ -360,6 +404,62 @@ class LatentDiffusionUNet(nn.Module):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
 
+    def _zero_scalar(self, device):
+        return torch.tensor(0.0, device=device)
+
+    def _reset_video_diagnostics(self, device):
+        self.video_gate_mean = self._zero_scalar(device)
+        self.video_attn_norm = self._zero_scalar(device)
+        self.video_token_norm = self._zero_scalar(device)
+
+    def apply_frame_positional_embedding(self, video_tokens):
+        """Add frame positions while preserving all-zero token samples."""
+        if video_tokens is None:
+            return None
+        if video_tokens.dim() != 3:
+            raise ValueError(
+                "video_tokens must have shape [B, F, D], got "
+                f"{tuple(video_tokens.shape)}"
+            )
+        if video_tokens.size(-1) != self.video_dim:
+            raise ValueError(
+                f"video token dim {video_tokens.size(-1)} does not match "
+                f"U-Net video_dim={self.video_dim}"
+            )
+        frame_count = video_tokens.size(1)
+        if frame_count > self.max_video_frames:
+            raise ValueError(
+                f"video frame count {frame_count} exceeds supported "
+                f"max_video_frames={self.max_video_frames}"
+            )
+
+        pos = self.frame_pos_embed[:, :frame_count].to(
+            device=video_tokens.device, dtype=video_tokens.dtype,
+        )
+        nonzero = (
+            video_tokens.detach().abs().sum(dim=(1, 2), keepdim=True) > 0
+        ).to(dtype=video_tokens.dtype)
+        return video_tokens + nonzero * pos
+
+    def _record_video_diagnostics(self, video_tokens, attn_stats):
+        if video_tokens is None:
+            self._reset_video_diagnostics(device=None)
+            return
+        device = video_tokens.device
+        if attn_stats:
+            gate_values = torch.stack([stats["gate"] for stats in attn_stats])
+            attn_values = torch.stack(
+                [stats["attn_norm"] for stats in attn_stats]
+            )
+            self.video_gate_mean = gate_values.mean().detach()
+            self.video_attn_norm = attn_values.mean().detach()
+        else:
+            self.video_gate_mean = self._zero_scalar(device)
+            self.video_attn_norm = self._zero_scalar(device)
+        self.video_token_norm = (
+            video_tokens.detach().pow(2).mean().sqrt()
+        )
+
     def forward(self, x, t, video_tokens=None):
         """
         Args:
@@ -370,20 +470,24 @@ class LatentDiffusionUNet(nn.Module):
             epsilon_pred: [B, 8, 10, 50]
         """
         time_emb = self.time_embed(t)
+        video_tokens = self.apply_frame_positional_embedding(video_tokens)
+        attn_stats = []
 
         # Encoder
         skips = []
         h = x
-        for block in self.encoder_blocks:
+        for block, attn in zip(self.encoder_blocks, self.encoder_attns):
             h = block(h, time_emb)
+            if video_tokens is not None:
+                h, stats = attn(h, video_tokens)
+                attn_stats.append(stats)
             skips.append(h)
 
         # Bottleneck
         h = self.bottleneck_block(h, time_emb)
-
-        # Cross-attention with video tokens
         if video_tokens is not None:
-            h = h + self.cross_attn(h, video_tokens)
+            h, stats = self.bottleneck_attn(h, video_tokens)
+            attn_stats.append(stats)
 
         # Decoder with skip connections
         for level in range(len(self.decoder_upsamples)):
@@ -392,9 +496,13 @@ class LatentDiffusionUNet(nn.Module):
             skip = skips[-(level + 2)]  # matching skip
             h = torch.cat([h, skip], dim=1)
             h = self.decoder_resblocks[level](h, time_emb)
+            if video_tokens is not None:
+                h, stats = self.decoder_attns[level](h, video_tokens)
+                attn_stats.append(stats)
 
         # Final: concat first encoder skip and project
         h = torch.cat([h, skips[0]], dim=1)
         h = self.final_conv(h)
+        self._record_video_diagnostics(video_tokens, attn_stats)
 
         return h
