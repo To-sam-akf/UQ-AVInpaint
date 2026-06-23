@@ -12,6 +12,7 @@ if ROOT not in sys.path:
 import Options_inpainting
 from Models.VIAI_AV_inpainting import VIAIAVModel
 from networks.EC_VIAI_Modules import (
+    BottleneckAdapter,
     EvidenceFusionGate,
     apply_visual_evidence_augmentation,
 )
@@ -244,3 +245,50 @@ def test_frozen_backbone_train_modes_keep_encoders_eval():
 
     assert model.Mel_Encoder.training
     assert model.VideoEncoder.training
+
+
+def test_bottleneck_adapter_sigma_scale_is_optional_and_broadcasts():
+    torch.manual_seed(11)
+    adapter = BottleneckAdapter(feature_channels=3, hidden_channels=4)
+    mu = torch.zeros(2, 3, 1, 2)
+    logvar = torch.zeros_like(mu)
+
+    z_default, sigma_default = adapter.sample_latent(
+        mu,
+        logvar,
+        num_candidates=4,
+        sigma_min=0.0,
+        sigma_max=2.0,
+    )
+    z_scaled, sigma_scaled = adapter.sample_latent(
+        mu,
+        logvar,
+        num_candidates=4,
+        sigma_min=0.0,
+        sigma_max=2.0,
+        sigma_scale=torch.tensor([[[[0.5]]], [[[2.0]]]]),
+    )
+
+    assert tuple(z_default.shape) == (2, 4, 3, 1, 2)
+    assert sigma_default.shape == mu.shape
+    assert sigma_scaled.shape == mu.shape
+    assert torch.allclose(sigma_default, torch.ones_like(sigma_default))
+    assert torch.allclose(sigma_scaled[0], torch.full_like(sigma_scaled[0], 0.5))
+    assert torch.allclose(sigma_scaled[1], torch.full_like(sigma_scaled[1], 2.0))
+    assert torch.allclose(z_scaled[:, 0], mu)
+
+
+def test_sigma_scale_from_gate_target_is_larger_for_low_evidence():
+    model = object.__new__(VIAIAVModel)
+    model.hparams = SimpleNamespace(
+        evidence_sigma_scale_min=0.5,
+        evidence_sigma_scale_max=2.0,
+    )
+    gate_target = torch.tensor([[[[1.0]]], [[[0.5]]], [[[0.0]]]])
+
+    sigma_scale = model._sigma_scale_from_gate_target(gate_target)
+
+    assert sigma_scale[0].item() == 0.5
+    assert sigma_scale[1].item() == 1.25
+    assert sigma_scale[2].item() == 2.0
+    assert sigma_scale[0].item() < sigma_scale[1].item() < sigma_scale[2].item()

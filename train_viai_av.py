@@ -74,6 +74,7 @@ def print_viai_av_run_config():
         f"test_num_candidates={getattr(hparams, 'test_num_candidates', 1)} "
         f"stochastic_adapter={getattr(hparams, 'stochastic_adapter', False)} "
         f"deterministic_adapter={getattr(hparams, 'deterministic_adapter', False)} "
+        f"enable_candidate_scorer={getattr(hparams, 'enable_candidate_scorer', False)} "
         f"save_candidates={getattr(hparams, 'save_candidates', False)} "
         f"video_perturbation={getattr(hparams, 'video_perturbation', 'none')}"
     )
@@ -84,9 +85,13 @@ def print_viai_av_run_config():
         f"lambda_boundary={getattr(hparams, 'lambda_boundary', 0.0)} "
         f"lambda_diversity={getattr(hparams, 'lambda_diversity', 0.0)} "
         f"lambda_calib={getattr(hparams, 'lambda_calib', 0.0)} "
+        f"calib_error_tau={getattr(hparams, 'calib_error_tau', 0.1)} "
         f"lambda_gate_evidence={getattr(hparams, 'lambda_gate_evidence', 0.0)} "
         f"enable_evidence_gate={getattr(hparams, 'enable_evidence_gate', False)} "
         f"freeze_gate_evidence_backbone={getattr(hparams, 'freeze_gate_evidence_backbone', False)} "
+        f"enable_evidence_scaled_sigma={getattr(hparams, 'enable_evidence_scaled_sigma', False)} "
+        f"evidence_sigma_scale_min={getattr(hparams, 'evidence_sigma_scale_min', 0.5)} "
+        f"evidence_sigma_scale_max={getattr(hparams, 'evidence_sigma_scale_max', 2.0)} "
         f"evidence_source={getattr(hparams, 'evidence_source', 'none')} "
         f"evidence_diversity_d_min={getattr(hparams, 'evidence_diversity_d_min', 0.02)} "
         f"evidence_diversity_alpha={getattr(hparams, 'evidence_diversity_alpha', 0.08)} "
@@ -237,14 +242,25 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         "loss_boundary": 0.0,
         "loss_evidence_div": 0.0,
         "loss_gate_evidence": 0.0,
+        "loss_candidate_scorer": 0.0,
+        "loss_uncertainty_calib": 0.0,
+        "loss_calib": 0.0,
         "loss_multi_candidate": 0.0,
         "weighted_loss_min_k": 0.0,
         "weighted_loss_mean_k": 0.0,
         "weighted_loss_boundary": 0.0,
         "weighted_loss_evidence_div": 0.0,
         "weighted_loss_gate_evidence": 0.0,
+        "weighted_loss_calib": 0.0,
         "best_of_k_missing_l1": 0.0,
         "mean_k_missing_l1": 0.0,
+        "top1_missing_l1": 0.0,
+        "candidate0_missing_l1": 0.0,
+        "random_expected_missing_l1": 0.0,
+        "oracle_gain": 0.0,
+        "uncertainty_mean": 0.0,
+        "candidate_pi_entropy": 0.0,
+        "candidate_pi_max": 0.0,
         "candidate_pairwise_distance": 0.0,
         "evidence_diversity_gap": 0.0,
         "gate_mean": 0.0,
@@ -313,14 +329,25 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         totals["loss_boundary"] += model.loss_boundary_item
         totals["loss_evidence_div"] += model.loss_evidence_div_item
         totals["loss_gate_evidence"] += model.loss_gate_evidence_item
+        totals["loss_candidate_scorer"] += model.loss_candidate_scorer_item
+        totals["loss_uncertainty_calib"] += model.loss_uncertainty_calib_item
+        totals["loss_calib"] += model.loss_calib_item
         totals["loss_multi_candidate"] += model.loss_multi_candidate_item
         totals["weighted_loss_min_k"] += model.weighted_loss_min_k_item
         totals["weighted_loss_mean_k"] += model.weighted_loss_mean_k_item
         totals["weighted_loss_boundary"] += model.weighted_loss_boundary_item
         totals["weighted_loss_evidence_div"] += model.weighted_loss_evidence_div_item
         totals["weighted_loss_gate_evidence"] += model.weighted_loss_gate_evidence_item
+        totals["weighted_loss_calib"] += model.weighted_loss_calib_item
         totals["best_of_k_missing_l1"] += model.best_of_k_missing_l1_item
         totals["mean_k_missing_l1"] += model.mean_k_missing_l1_item
+        totals["top1_missing_l1"] += model.top1_missing_l1_item
+        totals["candidate0_missing_l1"] += model.candidate0_missing_l1_item
+        totals["random_expected_missing_l1"] += model.random_expected_missing_l1_item
+        totals["oracle_gain"] += model.oracle_gain_item
+        totals["uncertainty_mean"] += model.uncertainty_mean_item
+        totals["candidate_pi_entropy"] += model.candidate_pi_entropy_item
+        totals["candidate_pi_max"] += model.candidate_pi_max_item
         totals["candidate_pairwise_distance"] += model.candidate_pairwise_distance_item
         totals["evidence_diversity_gap"] += model.evidence_diversity_gap_item
         totals["gate_mean"] += model.gate_mean_item
@@ -342,6 +369,8 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
             loss=f"{model.loss_total_item:.4f}",
             recon=f"{model.loss_recon_item:.4f}",
             min_k=f"{model.loss_min_k_item:.4f}",
+            top1=f"{model.top1_missing_l1_item:.4f}",
+            u=f"{model.uncertainty_mean_item:.3f}",
             mean_k=f"{model.loss_mean_k_item:.4f}",
             gate=f"{model.gate_mean_item:.3f}",
             gate_t=f"{model.gate_target_mean_item:.3f}",
@@ -383,8 +412,19 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
                 f"boundary={model.loss_boundary_item:.6f} "
                 f"evidence_div={model.loss_evidence_div_item:.6f} "
                 f"gate_ev={model.loss_gate_evidence_item:.6f} "
+                f"scorer={model.loss_candidate_scorer_item:.6f} "
+                f"unc_calib={model.loss_uncertainty_calib_item:.6f} "
+                f"calib={model.loss_calib_item:.6f} "
                 f"multi={model.loss_multi_candidate_item:.6f} "
+                f"weighted_calib={model.weighted_loss_calib_item:.6f} "
                 f"best_of_k={model.best_of_k_missing_l1_item:.6f} "
+                f"top1={model.top1_missing_l1_item:.6f} "
+                f"candidate0={model.candidate0_missing_l1_item:.6f} "
+                f"random={model.random_expected_missing_l1_item:.6f} "
+                f"oracle_gain={model.oracle_gain_item:.6f} "
+                f"uncertainty={model.uncertainty_mean_item:.6f} "
+                f"pi_entropy={model.candidate_pi_entropy_item:.6f} "
+                f"pi_max={model.candidate_pi_max_item:.6f} "
                 f"pairwise={model.candidate_pairwise_distance_item:.6f} "
                 f"div_gap={model.evidence_diversity_gap_item:.6f} "
                 f"gate_mean={model.gate_mean_item:.6f} "
@@ -448,14 +488,27 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         "loss_boundary": totals["loss_boundary"] / batch_count,
         "loss_evidence_div": totals["loss_evidence_div"] / batch_count,
         "loss_gate_evidence": totals["loss_gate_evidence"] / batch_count,
+        "loss_candidate_scorer": totals["loss_candidate_scorer"] / batch_count,
+        "loss_uncertainty_calib": totals["loss_uncertainty_calib"] / batch_count,
+        "loss_calib": totals["loss_calib"] / batch_count,
         "loss_multi_candidate": totals["loss_multi_candidate"] / batch_count,
         "weighted_loss_min_k": totals["weighted_loss_min_k"] / batch_count,
         "weighted_loss_mean_k": totals["weighted_loss_mean_k"] / batch_count,
         "weighted_loss_boundary": totals["weighted_loss_boundary"] / batch_count,
         "weighted_loss_evidence_div": totals["weighted_loss_evidence_div"] / batch_count,
         "weighted_loss_gate_evidence": totals["weighted_loss_gate_evidence"] / batch_count,
+        "weighted_loss_calib": totals["weighted_loss_calib"] / batch_count,
         "best_of_k_missing_l1": totals["best_of_k_missing_l1"] / batch_count,
         "mean_k_missing_l1": totals["mean_k_missing_l1"] / batch_count,
+        "top1_missing_l1": totals["top1_missing_l1"] / batch_count,
+        "candidate0_missing_l1": totals["candidate0_missing_l1"] / batch_count,
+        "random_expected_missing_l1": (
+            totals["random_expected_missing_l1"] / batch_count
+        ),
+        "oracle_gain": totals["oracle_gain"] / batch_count,
+        "uncertainty_mean": totals["uncertainty_mean"] / batch_count,
+        "candidate_pi_entropy": totals["candidate_pi_entropy"] / batch_count,
+        "candidate_pi_max": totals["candidate_pi_max"] / batch_count,
         "candidate_pairwise_distance": totals["candidate_pairwise_distance"] / batch_count,
         "evidence_diversity_gap": totals["evidence_diversity_gap"] / batch_count,
         "gate_mean": totals["gate_mean"] / batch_count,
@@ -498,8 +551,19 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         f"boundary={averages['loss_boundary']:.6f} "
         f"evidence_div={averages['loss_evidence_div']:.6f} "
         f"gate_ev={averages['loss_gate_evidence']:.6f} "
+        f"scorer={averages['loss_candidate_scorer']:.6f} "
+        f"unc_calib={averages['loss_uncertainty_calib']:.6f} "
+        f"calib={averages['loss_calib']:.6f} "
         f"multi={averages['loss_multi_candidate']:.6f} "
+        f"weighted_calib={averages['weighted_loss_calib']:.6f} "
         f"best_of_k={averages['best_of_k_missing_l1']:.6f} "
+        f"top1={averages['top1_missing_l1']:.6f} "
+        f"candidate0={averages['candidate0_missing_l1']:.6f} "
+        f"random={averages['random_expected_missing_l1']:.6f} "
+        f"oracle_gain={averages['oracle_gain']:.6f} "
+        f"uncertainty={averages['uncertainty_mean']:.6f} "
+        f"pi_entropy={averages['candidate_pi_entropy']:.6f} "
+        f"pi_max={averages['candidate_pi_max']:.6f} "
         f"pairwise={averages['candidate_pairwise_distance']:.6f} "
         f"div_gap={averages['evidence_diversity_gap']:.6f} "
         f"gate_mean={averages['gate_mean']:.6f} "

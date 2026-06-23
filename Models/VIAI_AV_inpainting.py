@@ -3,6 +3,7 @@ import random
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 from Data_loaders import mel_loader
 from loss_functions import GANLoss, L2ContrastiveLoss
@@ -49,8 +50,14 @@ class VIAIAVModel(object):
         self.use_evidence_gate = self.enable_ec_viai_av and bool(
             getattr(hparams, "enable_evidence_gate", False)
         )
+        self.use_candidate_scorer = self.enable_ec_viai_av and bool(
+            getattr(hparams, "enable_candidate_scorer", False)
+        )
         self.freeze_gate_evidence_backbone = bool(
             getattr(hparams, "freeze_gate_evidence_backbone", False)
+        )
+        self.enable_evidence_scaled_sigma = bool(
+            getattr(hparams, "enable_evidence_scaled_sigma", False)
         )
         self.enable_visual_evidence_aug = bool(
             getattr(hparams, "enable_visual_evidence_aug", False)
@@ -68,6 +75,16 @@ class VIAIAVModel(object):
             raise ValueError(
                 "--stochastic_adapter and --deterministic_adapter cannot both be enabled."
             )
+        if self.use_candidate_scorer and not self.use_stochastic_adapter:
+            raise ValueError(
+                "--enable_candidate_scorer requires "
+                "--enable_ec_viai_av --stochastic_adapter."
+            )
+        lambda_calib = float(getattr(hparams, "lambda_calib", 0.0))
+        if lambda_calib > 0.0 and not self.use_candidate_scorer:
+            raise ValueError("--lambda_calib > 0 requires --enable_candidate_scorer.")
+        if float(getattr(hparams, "calib_error_tau", 0.1)) <= 0.0:
+            raise ValueError("--calib_error_tau must be > 0.")
         self.train_num_candidates = int(getattr(hparams, "num_candidates", 1))
         self.test_num_candidates = int(
             getattr(hparams, "test_num_candidates", self.train_num_candidates)
@@ -107,6 +124,11 @@ class VIAIAVModel(object):
         self.EvidenceFusionGate = None
         if self.use_evidence_gate:
             self.EvidenceFusionGate = EC_VIAI_Modules.EvidenceFusionGate().to(self.device)
+        self.CandidateScorer = None
+        self.UncertaintyHead = None
+        if self.use_candidate_scorer:
+            self.CandidateScorer = EC_VIAI_Modules.CandidateScorer().to(self.device)
+            self.UncertaintyHead = EC_VIAI_Modules.UncertaintyHead().to(self.device)
         if self.freeze_gate_evidence_backbone:
             self._set_module_requires_grad(self.Mel_Encoder, False)
             self._set_module_requires_grad(self.VideoEncoder, False)
@@ -118,6 +140,7 @@ class VIAIAVModel(object):
             max_violation=False,
         )
         self.criterion_gate_evidence = nn.SmoothL1Loss()
+        self.criterion_uncertainty_calib = nn.SmoothL1Loss()
 
         generator_params = []
         if not self.freeze_gate_evidence_backbone:
@@ -128,6 +151,9 @@ class VIAIAVModel(object):
             generator_params += list(self.BottleneckAdapter.parameters())
         if self.use_evidence_gate:
             generator_params += list(self.EvidenceFusionGate.parameters())
+        if self.use_candidate_scorer:
+            generator_params += list(self.CandidateScorer.parameters())
+            generator_params += list(self.UncertaintyHead.parameters())
         self.optimizer_G = torch.optim.Adam(
             generator_params,
             lr=hparams.lr,
@@ -170,8 +196,22 @@ class VIAIAVModel(object):
         self.weighted_loss_boundary_item = 0.0
         self.weighted_loss_evidence_div_item = 0.0
         self.weighted_loss_gate_evidence_item = 0.0
+        self.loss_candidate_scorer_item = 0.0
+        self.loss_uncertainty_calib_item = 0.0
+        self.loss_calib_item = 0.0
+        self.weighted_loss_calib_item = 0.0
         self.best_of_k_missing_l1_item = 0.0
         self.mean_k_missing_l1_item = 0.0
+        self.top1_missing_l1_item = 0.0
+        self.candidate0_missing_l1_item = 0.0
+        self.random_expected_missing_l1_item = 0.0
+        self.oracle_gain_item = 0.0
+        self.uncertainty_mean_item = 0.0
+        self.uncertainty_min_item = 0.0
+        self.uncertainty_max_item = 0.0
+        self.candidate_top1_index_mean_item = 0.0
+        self.candidate_pi_entropy_item = 0.0
+        self.candidate_pi_max_item = 0.0
         self.loss_D_item = 0.0
         self.loss_D_real_item = 0.0
         self.loss_D_fake_item = 0.0
@@ -206,8 +246,14 @@ class VIAIAVModel(object):
         self.adapter_residual_l1_item = 0.0
         self.adapter_logvar = torch.zeros(1, 256, 1, 1, device=self.device)
         self.adapter_sigma = torch.zeros(1, 256, 1, 1, device=self.device)
+        self.adapter_sigma_scale = torch.ones(1, 1, 1, 1, device=self.device)
+        self.adapter_effective_sigma = torch.zeros(1, 256, 1, 1, device=self.device)
         self.adapter_logvar_mean_item = 0.0
         self.adapter_sigma_mean_item = 0.0
+        self.adapter_sigma_scale_mean_item = 1.0
+        self.adapter_sigma_scale_min_item = 1.0
+        self.adapter_sigma_scale_max_item = 1.0
+        self.adapter_effective_sigma_mean_item = 0.0
         self.candidate_pairwise_distance_per_sample = torch.zeros(1, device=self.device)
         self.candidate_pairwise_distance = torch.zeros((), device=self.device)
         self.candidate_pairwise_distance_item = 0.0
@@ -216,6 +262,25 @@ class VIAIAVModel(object):
         self.evidence_diversity_gap_item = 0.0
         self.candidate_pairwise_l1 = torch.zeros((), device=self.device)
         self.candidate_pairwise_l1_item = 0.0
+        self.candidate_logits = torch.zeros(1, 1, device=self.device)
+        self.candidate_pi = torch.ones(1, 1, device=self.device)
+        self.candidate_top1_index = torch.zeros(1, device=self.device, dtype=torch.long)
+        self.candidate_missing_l1 = torch.zeros(1, 1, device=self.device)
+        self.top1_missing_l1 = torch.zeros((), device=self.device)
+        self.candidate0_missing_l1 = torch.zeros((), device=self.device)
+        self.random_expected_missing_l1 = torch.zeros((), device=self.device)
+        self.oracle_gain = torch.zeros((), device=self.device)
+        self.top1_missing_l1_per_sample = torch.zeros(1, device=self.device)
+        self.best_of_k_missing_l1_per_sample = torch.zeros(1, device=self.device)
+        self.candidate0_missing_l1_per_sample = torch.zeros(1, device=self.device)
+        self.random_expected_missing_l1_per_sample = torch.zeros(1, device=self.device)
+        self.candidate_pi_entropy = torch.zeros((), device=self.device)
+        self.candidate_pi_max = torch.ones((), device=self.device)
+        self.uncertainty_score = torch.zeros(1, 1, device=self.device)
+        self.loss_candidate_scorer = torch.zeros((), device=self.device)
+        self.loss_uncertainty_calib = torch.zeros((), device=self.device)
+        self.loss_calib = torch.zeros((), device=self.device)
+        self.weighted_loss_calib = torch.zeros((), device=self.device)
         mel_height = int(getattr(hparams, "cin_channels", 80))
         mel_width = int(getattr(hparams, "max_mel_lengths", 200))
         self.mel_candidates = torch.zeros(1, 1, 1, mel_height, mel_width, device=self.device)
@@ -241,12 +306,16 @@ class VIAIAVModel(object):
             self.BottleneckAdapter.train()
         if self.use_evidence_gate:
             self.EvidenceFusionGate.train()
+        if getattr(self, "use_candidate_scorer", False):
+            self.CandidateScorer.train()
+            self.UncertaintyHead.train()
 
     def _print_loss_configuration(self):
         lambda_gan = getattr(self.hparams, "lambda_gan", 1.0)
         lambda_recon = getattr(self.hparams, "lambda_recon", 1.0)
         lambda_sync = getattr(self.hparams, "lambda_sync", 1.0)
         lambda_probe = getattr(self.hparams, "lambda_probe", 1.0)
+        lambda_calib = getattr(self.hparams, "lambda_calib", 0.0)
         print(
             "[VIAI-AV] loss weights: "
             f"use_gan={self.use_gan} "
@@ -254,6 +323,7 @@ class VIAIAVModel(object):
             f"lambda_recon={lambda_recon} "
             f"lambda_sync={lambda_sync} "
             f"lambda_probe={lambda_probe} "
+            f"lambda_calib={lambda_calib} "
             f"enable_sync_loss={self.enable_sync_loss} "
             f"enable_probe_loss={self.enable_probe_loss}"
         )
@@ -264,7 +334,9 @@ class VIAIAVModel(object):
             f"use_stochastic_adapter={self.use_stochastic_adapter} "
             f"use_bottleneck_adapter={self.use_bottleneck_adapter} "
             f"use_evidence_gate={self.use_evidence_gate} "
+            f"use_candidate_scorer={self.use_candidate_scorer} "
             f"freeze_gate_evidence_backbone={self.freeze_gate_evidence_backbone} "
+            f"enable_evidence_scaled_sigma={self.enable_evidence_scaled_sigma} "
             f"enable_visual_evidence_aug={self.enable_visual_evidence_aug} "
             f"num_candidates={self.train_num_candidates} "
             f"test_num_candidates={self.test_num_candidates}"
@@ -281,7 +353,7 @@ class VIAIAVModel(object):
                 "[VIAI-AV] total formula: "
                 "loss_total = loss_av_gen + lambda_sync * loss_sync "
                 "+ lambda_probe * eta2 * loss_probe_gen + loss_multi_candidate "
-                "+ weighted_loss_gate_evidence"
+                "+ weighted_loss_gate_evidence + weighted_loss_calib"
             )
 
     def _eta(self, step, base, interval, floor):
@@ -367,6 +439,12 @@ class VIAIAVModel(object):
         target = (evidence - low) / (high - low)
         return torch.clamp(target, min=0.0, max=1.0)
 
+    def _sigma_scale_from_gate_target(self, gate_target):
+        min_scale = float(getattr(self.hparams, "evidence_sigma_scale_min", 0.5))
+        max_scale = float(getattr(self.hparams, "evidence_sigma_scale_max", 2.0))
+        uncertainty = 1.0 - gate_target.detach()
+        return min_scale + (max_scale - min_scale) * uncertainty
+
     def _expand_features_for_candidates(self, features, num_candidates):
         expanded_features = []
         for feature in features:
@@ -439,6 +517,200 @@ class VIAIAVModel(object):
         self.candidate_pairwise_distance = self.candidate_pairwise_distance_per_sample.mean()
         self.candidate_pairwise_l1 = self.candidate_pairwise_distance
 
+    def _candidate_missing_input_l1_proxy(self):
+        mask = self.missing_mask.unsqueeze(1).to(
+            device=self.mel_candidates.device,
+            dtype=self.mel_candidates.dtype,
+        )
+        mel_input = self.mel_input_4d.unsqueeze(1).to(
+            device=self.mel_candidates.device,
+            dtype=self.mel_candidates.dtype,
+        )
+        proxy_abs = torch.abs(self.mel_candidates - mel_input) * mask
+        proxy_den = torch.clamp(mask.sum(dim=(2, 3, 4)), min=1.0)
+        return proxy_abs.sum(dim=(2, 3, 4)) / proxy_den
+
+    def _candidate_boundary_jump_proxy(self):
+        start, end = self.missing_span
+        start = int(start)
+        end = int(end)
+        time_steps = int(self.mel_completed_candidates.size(-1))
+        jumps = []
+        if 0 < start < time_steps:
+            left_jump = torch.abs(
+                self.mel_completed_candidates[..., start]
+                - self.mel_completed_candidates[..., start - 1]
+            ).mean(dim=(2, 3))
+            jumps.append(left_jump)
+        if 0 < end < time_steps:
+            right_jump = torch.abs(
+                self.mel_completed_candidates[..., end]
+                - self.mel_completed_candidates[..., end - 1]
+            ).mean(dim=(2, 3))
+            jumps.append(right_jump)
+        if not jumps:
+            return torch.zeros(
+                self.mel_completed_candidates.size(0),
+                self.mel_completed_candidates.size(1),
+                device=self.mel_completed_candidates.device,
+                dtype=self.mel_completed_candidates.dtype,
+            )
+        return sum(jumps) / len(jumps)
+
+    def _candidate_sync_score_proxy(self, decoder_video_feature):
+        batch_size, num_candidates = self.mel_completed_candidates.shape[:2]
+        previous_training = self.Mel_Encoder.training
+        self.Mel_Encoder.eval()
+        with torch.no_grad():
+            candidate_features = self.Mel_Encoder(
+                self.mel_completed_candidates.detach().reshape(
+                    batch_size * num_candidates,
+                    self.mel_completed_candidates.size(2),
+                    self.mel_completed_candidates.size(3),
+                    self.mel_completed_candidates.size(4),
+                )
+            )[-1].flatten(1)
+            video_embedding = decoder_video_feature.detach().flatten(1)
+            video_embedding = video_embedding.unsqueeze(1).expand(
+                batch_size,
+                num_candidates,
+                video_embedding.size(1),
+            )
+            video_embedding = video_embedding.reshape(batch_size * num_candidates, -1)
+            candidate_embedding = F.normalize(candidate_features, p=2, dim=1)
+            video_embedding = F.normalize(video_embedding, p=2, dim=1)
+            distance = torch.norm(
+                candidate_embedding - video_embedding,
+                p=2,
+                dim=1,
+            ).reshape(batch_size, num_candidates)
+            sync_score = 1.0 - torch.clamp(distance / 2.0, min=0.0, max=1.0)
+        if previous_training:
+            self.Mel_Encoder.train()
+        return sync_score.to(dtype=self.mel_candidates.dtype)
+
+    def _candidate_scorer_stats(self, decoder_video_feature):
+        missing_proxy = self._candidate_missing_input_l1_proxy()
+        boundary_proxy = self._candidate_boundary_jump_proxy()
+        sync_score = self._candidate_sync_score_proxy(decoder_video_feature)
+        return torch.stack([missing_proxy, boundary_proxy, sync_score], dim=2)
+
+    def _gather_candidate(self, candidates, indices):
+        gather_index = indices.view(-1, 1, 1, 1, 1).expand(
+            -1,
+            1,
+            candidates.size(2),
+            candidates.size(3),
+            candidates.size(4),
+        )
+        return torch.gather(candidates, dim=1, index=gather_index).squeeze(1)
+
+    def _default_candidate_scores(self, batch_size, num_candidates, reference):
+        self.candidate_logits = torch.zeros(
+            batch_size,
+            num_candidates,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        self.candidate_pi = torch.zeros_like(self.candidate_logits)
+        self.candidate_pi[:, 0] = 1.0
+        self.candidate_top1_index = torch.zeros(
+            batch_size,
+            device=reference.device,
+            dtype=torch.long,
+        )
+        self.uncertainty_score = torch.zeros(
+            batch_size,
+            1,
+            device=reference.device,
+            dtype=reference.dtype,
+        )
+        self.candidate_pi_entropy = torch.zeros((), device=reference.device, dtype=reference.dtype)
+        self.candidate_pi_max = torch.ones((), device=reference.device, dtype=reference.dtype)
+
+    def _score_and_select_candidates(self, decoder_video_feature):
+        self._update_candidate_pairwise_metrics()
+        batch_size, num_candidates = self.mel_candidates.shape[:2]
+        if not getattr(self, "use_candidate_scorer", False):
+            self._default_candidate_scores(batch_size, num_candidates, self.mel_candidates)
+        else:
+            candidate_stats = self._candidate_scorer_stats(decoder_video_feature)
+            self.candidate_logits, self.candidate_pi = self.CandidateScorer(
+                candidate_stats.detach(),
+                self.mel_features[-1].detach(),
+                decoder_video_feature.detach(),
+                self.evidence_score.detach(),
+            )
+            self.candidate_top1_index = torch.argmax(self.candidate_pi, dim=1)
+            eps = 1e-8
+            if num_candidates > 1:
+                entropy_norm = torch.log(
+                    torch.tensor(
+                        float(num_candidates),
+                        device=self.candidate_pi.device,
+                        dtype=self.candidate_pi.dtype,
+                    )
+                )
+                entropy = -(
+                    self.candidate_pi * torch.log(torch.clamp(self.candidate_pi, min=eps))
+                ).sum(dim=1, keepdim=True) / entropy_norm
+            else:
+                entropy = torch.zeros(
+                    batch_size,
+                    1,
+                    device=self.candidate_pi.device,
+                    dtype=self.candidate_pi.dtype,
+                )
+            max_pi = self.candidate_pi.max(dim=1, keepdim=True).values
+            top1_proxy = torch.gather(
+                candidate_stats[:, :, 0].detach(),
+                dim=1,
+                index=self.candidate_top1_index.view(-1, 1),
+            )
+            evidence = self.evidence_score.to(
+                device=self.mel_candidates.device,
+                dtype=self.mel_candidates.dtype,
+            ).reshape(batch_size, -1)
+            if evidence.size(1) != 1:
+                evidence = evidence.mean(dim=1, keepdim=True)
+            gate = self.gate_value.reshape(batch_size, -1).to(
+                device=self.mel_candidates.device,
+                dtype=self.mel_candidates.dtype,
+            )
+            if gate.size(1) != 1:
+                gate = gate.mean(dim=1, keepdim=True)
+            sigma_scale = self.adapter_sigma_scale.reshape(batch_size, -1).to(
+                device=self.mel_candidates.device,
+                dtype=self.mel_candidates.dtype,
+            )
+            if sigma_scale.size(1) != 1:
+                sigma_scale = sigma_scale.mean(dim=1, keepdim=True)
+            uncertainty_stats = torch.cat(
+                [
+                    entropy.detach(),
+                    max_pi.detach(),
+                    top1_proxy.detach(),
+                    self.candidate_pairwise_distance_per_sample.detach().view(batch_size, 1),
+                    evidence.detach(),
+                    gate.detach(),
+                    sigma_scale.detach(),
+                ],
+                dim=1,
+            )
+            self.uncertainty_score = self.UncertaintyHead(
+                self.mel_features[-1].detach(),
+                decoder_video_feature.detach(),
+                uncertainty_stats,
+            )
+            self.candidate_pi_entropy = entropy.mean()
+            self.candidate_pi_max = max_pi.mean()
+
+        self.mel_pred = self._gather_candidate(self.mel_candidates, self.candidate_top1_index)
+        self.mel_completed_pred = self._gather_candidate(
+            self.mel_completed_candidates,
+            self.candidate_top1_index,
+        )
+
     def _forward_inpainter(self):
         self.mel_features = self.Mel_Encoder(self.mel_input)
         self.video_feature = self.VideoEncoder(self.video_batch, self.flow_batch)
@@ -485,6 +757,20 @@ class VIAIAVModel(object):
         decoder_features = self.mel_features
         if self.use_stochastic_adapter:
             num_candidates = int(self.current_num_candidates)
+            self.adapter_sigma_scale = torch.ones(
+                self.video_feature.size(0),
+                1,
+                1,
+                1,
+                device=self.video_feature.device,
+                dtype=self.video_feature.dtype,
+            )
+            sigma_scale_arg = None
+            if self.enable_evidence_scaled_sigma:
+                self.adapter_sigma_scale = self._sigma_scale_from_gate_target(
+                    self.gate_target
+                ).to(device=self.video_feature.device, dtype=self.video_feature.dtype)
+                sigma_scale_arg = self.adapter_sigma_scale
             (
                 adapter_residuals,
                 _adapter_mu,
@@ -496,7 +782,9 @@ class VIAIAVModel(object):
                 num_candidates=num_candidates,
                 sigma_min=getattr(self.hparams, "sigma_min", 0.0),
                 sigma_max=getattr(self.hparams, "sigma_max", 1.0),
+                sigma_scale=sigma_scale_arg,
             )
+            self.adapter_effective_sigma = self.adapter_sigma
             batch_size = self.mel_features[-1].size(0)
             self.adapter_residual = adapter_residuals[:, 0]
             decoder_features = self._expand_features_for_candidates(
@@ -538,6 +826,15 @@ class VIAIAVModel(object):
             decoder_features[-1] = decoder_features[-1] + self.adapter_residual
             self.adapter_logvar = torch.zeros_like(self.mel_features[-1])
             self.adapter_sigma = torch.zeros_like(self.mel_features[-1])
+            self.adapter_sigma_scale = torch.ones(
+                self.mel_features[-1].size(0),
+                1,
+                1,
+                1,
+                device=self.mel_features[-1].device,
+                dtype=self.mel_features[-1].dtype,
+            )
+            self.adapter_effective_sigma = torch.zeros_like(self.mel_features[-1])
             self.mel_pred = self.Mel_Decoder(
                 decoder_features,
                 self.mel_input_4d.size(),
@@ -551,6 +848,15 @@ class VIAIAVModel(object):
             self.adapter_residual = torch.zeros_like(self.mel_features[-1])
             self.adapter_logvar = torch.zeros_like(self.mel_features[-1])
             self.adapter_sigma = torch.zeros_like(self.mel_features[-1])
+            self.adapter_sigma_scale = torch.ones(
+                self.mel_features[-1].size(0),
+                1,
+                1,
+                1,
+                device=self.mel_features[-1].device,
+                dtype=self.mel_features[-1].dtype,
+            )
+            self.adapter_effective_sigma = torch.zeros_like(self.mel_features[-1])
             self.mel_pred = self.Mel_Decoder(
                 decoder_features,
                 self.mel_input_4d.size(),
@@ -560,6 +866,7 @@ class VIAIAVModel(object):
             self.mel_completed_candidates = self._compose_candidate_mels(self.mel_candidates)
             self.mel_completed_pred = self.mel_completed_candidates[:, 0]
             self._update_candidate_pairwise_metrics()
+        self._score_and_select_candidates(decoder_video_feature)
         if self.enable_probe_loss:
             self.mel_probe_pred = self.Mel_Decoder(
                 self.mel_features,
@@ -624,17 +931,42 @@ class VIAIAVModel(object):
             dtype=mel_candidates.dtype,
         )
         self._update_candidate_pairwise_metrics()
+        if not hasattr(self, "candidate_top1_index") or self.candidate_top1_index.numel() != mel_candidates.size(0):
+            self.candidate_top1_index = torch.zeros(
+                mel_candidates.size(0),
+                device=mel_candidates.device,
+                dtype=torch.long,
+            )
 
         self.loss_anchor, _, _ = self._reconstruction_losses(mel_candidates[:, 0])
         candidate_abs = torch.abs(mel_candidates - target) * mask
         candidate_missing_den = torch.clamp(mask.sum(dim=(2, 3, 4)), min=1.0)
-        candidate_missing_l1 = candidate_abs.sum(dim=(2, 3, 4)) / candidate_missing_den
+        self.candidate_missing_l1 = (
+            candidate_abs.sum(dim=(2, 3, 4)) / candidate_missing_den
+        )
 
-        self.loss_min_k = candidate_missing_l1.min(dim=1).values.mean()
-        self.loss_mean_k = candidate_missing_l1.mean()
+        best_per_sample = self.candidate_missing_l1.min(dim=1).values
+        top1_per_sample = torch.gather(
+            self.candidate_missing_l1,
+            dim=1,
+            index=self.candidate_top1_index.view(-1, 1),
+        ).squeeze(1)
+        candidate0_per_sample = self.candidate_missing_l1[:, 0]
+        random_expected_per_sample = self.candidate_missing_l1.mean(dim=1)
+        self.best_of_k_missing_l1_per_sample = best_per_sample
+        self.top1_missing_l1_per_sample = top1_per_sample
+        self.candidate0_missing_l1_per_sample = candidate0_per_sample
+        self.random_expected_missing_l1_per_sample = random_expected_per_sample
+
+        self.loss_min_k = best_per_sample.mean()
+        self.loss_mean_k = self.candidate_missing_l1.mean()
         self.loss_boundary = self._boundary_loss(self.mel_completed_candidates)
         self.best_of_k_missing_l1 = self.loss_min_k
         self.mean_k_missing_l1 = self.loss_mean_k
+        self.top1_missing_l1 = top1_per_sample.mean()
+        self.candidate0_missing_l1 = candidate0_per_sample.mean()
+        self.random_expected_missing_l1 = random_expected_per_sample.mean()
+        self.oracle_gain = self.top1_missing_l1 - self.best_of_k_missing_l1
 
         lambda_min_k = getattr(self.hparams, "lambda_min_k", 0.0)
         lambda_mean_k = getattr(self.hparams, "lambda_mean_k", 0.0)
@@ -669,6 +1001,33 @@ class VIAIAVModel(object):
             + self.weighted_loss_evidence_div
         )
         return self.loss_multi_candidate
+
+    def _calibration_losses(self):
+        if not getattr(self, "use_candidate_scorer", False):
+            zero = self._zero_loss_like(self.loss_av_gen)
+            self.loss_candidate_scorer = zero
+            self.loss_uncertainty_calib = zero
+            self.loss_calib = zero
+            self.weighted_loss_calib = zero
+            return self.weighted_loss_calib
+
+        best_idx = torch.argmin(self.candidate_missing_l1.detach(), dim=1)
+        self.loss_candidate_scorer = F.cross_entropy(self.candidate_logits, best_idx)
+        best_error = torch.gather(
+            self.candidate_missing_l1.detach(),
+            dim=1,
+            index=best_idx.view(-1, 1),
+        )
+        tau = float(getattr(self.hparams, "calib_error_tau", 0.1))
+        difficulty = 1.0 - torch.exp(-best_error / tau)
+        self.loss_uncertainty_calib = self.criterion_uncertainty_calib(
+            self.uncertainty_score,
+            difficulty,
+        )
+        self.loss_calib = self.loss_candidate_scorer + self.loss_uncertainty_calib
+        lambda_calib = float(getattr(self.hparams, "lambda_calib", 0.0))
+        self.weighted_loss_calib = lambda_calib * self.loss_calib
+        return self.weighted_loss_calib
 
     def _gate_evidence_loss(self):
         if not self.use_evidence_gate:
@@ -750,6 +1109,7 @@ class VIAIAVModel(object):
         self.weighted_loss_probe_gen = self.eta2 * self.loss_probe_gen
         self._multi_candidate_losses()
         self._gate_evidence_loss()
+        self._calibration_losses()
         baseline_loss_total = (
             self.loss_av_gen
             + lambda_sync * self.loss_sync
@@ -759,6 +1119,7 @@ class VIAIAVModel(object):
             baseline_loss_total
             + self.loss_multi_candidate
             + self.weighted_loss_gate_evidence
+            + self.weighted_loss_calib
         )
         if not self.use_gan:
             self.loss_D_real = self._zero_loss_like(self.loss_av_gen)
@@ -815,6 +1176,9 @@ class VIAIAVModel(object):
             self.BottleneckAdapter.eval()
         if self.use_evidence_gate:
             self.EvidenceFusionGate.eval()
+        if getattr(self, "use_candidate_scorer", False):
+            self.CandidateScorer.eval()
+            self.UncertaintyHead.eval()
         if self.use_gan:
             self.netD.eval()
         with torch.no_grad():
@@ -850,6 +1214,13 @@ class VIAIAVModel(object):
         self.loss_gate_evidence_item = float(
             self.loss_gate_evidence.detach().cpu().item()
         )
+        self.loss_candidate_scorer_item = float(
+            self.loss_candidate_scorer.detach().cpu().item()
+        )
+        self.loss_uncertainty_calib_item = float(
+            self.loss_uncertainty_calib.detach().cpu().item()
+        )
+        self.loss_calib_item = float(self.loss_calib.detach().cpu().item())
         self.loss_multi_candidate_item = float(
             self.loss_multi_candidate.detach().cpu().item()
         )
@@ -868,12 +1239,39 @@ class VIAIAVModel(object):
         self.weighted_loss_gate_evidence_item = float(
             self.weighted_loss_gate_evidence.detach().cpu().item()
         )
+        self.weighted_loss_calib_item = float(
+            self.weighted_loss_calib.detach().cpu().item()
+        )
         self.best_of_k_missing_l1_item = float(
             self.best_of_k_missing_l1.detach().cpu().item()
         )
         self.mean_k_missing_l1_item = float(
             self.mean_k_missing_l1.detach().cpu().item()
         )
+        self.top1_missing_l1_item = float(self.top1_missing_l1.detach().cpu().item())
+        self.candidate0_missing_l1_item = float(
+            self.candidate0_missing_l1.detach().cpu().item()
+        )
+        self.random_expected_missing_l1_item = float(
+            self.random_expected_missing_l1.detach().cpu().item()
+        )
+        self.oracle_gain_item = float(self.oracle_gain.detach().cpu().item())
+        self.uncertainty_mean_item = float(
+            self.uncertainty_score.detach().mean().cpu().item()
+        )
+        self.uncertainty_min_item = float(
+            self.uncertainty_score.detach().min().cpu().item()
+        )
+        self.uncertainty_max_item = float(
+            self.uncertainty_score.detach().max().cpu().item()
+        )
+        self.candidate_top1_index_mean_item = float(
+            self.candidate_top1_index.detach().float().mean().cpu().item()
+        )
+        self.candidate_pi_entropy_item = float(
+            self.candidate_pi_entropy.detach().cpu().item()
+        )
+        self.candidate_pi_max_item = float(self.candidate_pi_max.detach().cpu().item())
         self.loss_D_item = float(self.loss_D.detach().cpu().item())
         self.loss_D_real_item = float(self.loss_D_real.detach().cpu().item())
         self.loss_D_fake_item = float(self.loss_D_fake.detach().cpu().item())
@@ -906,6 +1304,18 @@ class VIAIAVModel(object):
             self.adapter_logvar.detach().mean().cpu().item()
         )
         self.adapter_sigma_mean_item = float(self.adapter_sigma.detach().mean().cpu().item())
+        self.adapter_sigma_scale_mean_item = float(
+            self.adapter_sigma_scale.detach().mean().cpu().item()
+        )
+        self.adapter_sigma_scale_min_item = float(
+            self.adapter_sigma_scale.detach().min().cpu().item()
+        )
+        self.adapter_sigma_scale_max_item = float(
+            self.adapter_sigma_scale.detach().max().cpu().item()
+        )
+        self.adapter_effective_sigma_mean_item = float(
+            self.adapter_effective_sigma.detach().mean().cpu().item()
+        )
         self.candidate_pairwise_distance_item = float(
             self.candidate_pairwise_distance.detach().cpu().item()
         )
@@ -945,6 +1355,13 @@ class VIAIAVModel(object):
         writer.add_scalar(f"{prefix}/loss_boundary", self.loss_boundary_item, step)
         writer.add_scalar(f"{prefix}/loss_evidence_div", self.loss_evidence_div_item, step)
         writer.add_scalar(f"{prefix}/loss_gate_evidence", self.loss_gate_evidence_item, step)
+        writer.add_scalar(f"{prefix}/loss_candidate_scorer", self.loss_candidate_scorer_item, step)
+        writer.add_scalar(
+            f"{prefix}/loss_uncertainty_calib",
+            self.loss_uncertainty_calib_item,
+            step,
+        )
+        writer.add_scalar(f"{prefix}/loss_calib", self.loss_calib_item, step)
         writer.add_scalar(
             f"{prefix}/loss_multi_candidate",
             self.loss_multi_candidate_item,
@@ -976,6 +1393,11 @@ class VIAIAVModel(object):
             step,
         )
         writer.add_scalar(
+            f"{prefix}/weighted_loss_calib",
+            self.weighted_loss_calib_item,
+            step,
+        )
+        writer.add_scalar(
             f"{prefix}/candidate/best_of_k_missing_l1",
             self.best_of_k_missing_l1_item,
             step,
@@ -985,6 +1407,36 @@ class VIAIAVModel(object):
             self.mean_k_missing_l1_item,
             step,
         )
+        writer.add_scalar(
+            f"{prefix}/candidate/top1_missing_l1",
+            self.top1_missing_l1_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/candidate/candidate0_missing_l1",
+            self.candidate0_missing_l1_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/candidate/random_expected_missing_l1",
+            self.random_expected_missing_l1_item,
+            step,
+        )
+        writer.add_scalar(f"{prefix}/candidate/oracle_gain", self.oracle_gain_item, step)
+        writer.add_scalar(
+            f"{prefix}/candidate/top1_index_mean",
+            self.candidate_top1_index_mean_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/candidate/pi_entropy",
+            self.candidate_pi_entropy_item,
+            step,
+        )
+        writer.add_scalar(f"{prefix}/candidate/pi_max", self.candidate_pi_max_item, step)
+        writer.add_scalar(f"{prefix}/uncertainty/mean", self.uncertainty_mean_item, step)
+        writer.add_scalar(f"{prefix}/uncertainty/min", self.uncertainty_min_item, step)
+        writer.add_scalar(f"{prefix}/uncertainty/max", self.uncertainty_max_item, step)
         writer.add_scalar(f"{prefix}/loss_d", self.loss_D_item, step)
         writer.add_scalar(f"{prefix}/loss_d_real", self.loss_D_real_item, step)
         writer.add_scalar(f"{prefix}/loss_d_fake", self.loss_D_fake_item, step)
@@ -1038,6 +1490,26 @@ class VIAIAVModel(object):
                 step,
             )
             writer.add_scalar(
+                f"{prefix}/adapter/sigma_scale_mean",
+                self.adapter_sigma_scale_mean_item,
+                step,
+            )
+            writer.add_scalar(
+                f"{prefix}/adapter/sigma_scale_min",
+                self.adapter_sigma_scale_min_item,
+                step,
+            )
+            writer.add_scalar(
+                f"{prefix}/adapter/sigma_scale_max",
+                self.adapter_sigma_scale_max_item,
+                step,
+            )
+            writer.add_scalar(
+                f"{prefix}/adapter/effective_sigma_mean",
+                self.adapter_effective_sigma_mean_item,
+                step,
+            )
+            writer.add_scalar(
                 f"{prefix}/candidate/pairwise_l1",
                 self.candidate_pairwise_l1_item,
                 step,
@@ -1067,8 +1539,22 @@ class VIAIAVModel(object):
             "deterministic_adapter": bool(getattr(self.hparams, "deterministic_adapter", False)),
             "stochastic_adapter": bool(getattr(self.hparams, "stochastic_adapter", False)),
             "enable_evidence_gate": bool(getattr(self.hparams, "enable_evidence_gate", False)),
+            "enable_candidate_scorer": bool(
+                getattr(self.hparams, "enable_candidate_scorer", False)
+            ),
+            "calib_error_tau": float(getattr(self.hparams, "calib_error_tau", 0.1)),
+            "lambda_calib": float(getattr(self.hparams, "lambda_calib", 0.0)),
             "freeze_gate_evidence_backbone": bool(
                 getattr(self.hparams, "freeze_gate_evidence_backbone", False)
+            ),
+            "enable_evidence_scaled_sigma": bool(
+                getattr(self.hparams, "enable_evidence_scaled_sigma", False)
+            ),
+            "evidence_sigma_scale_min": float(
+                getattr(self.hparams, "evidence_sigma_scale_min", 0.5)
+            ),
+            "evidence_sigma_scale_max": float(
+                getattr(self.hparams, "evidence_sigma_scale_max", 2.0)
             ),
             "num_candidates": int(getattr(self.hparams, "num_candidates", 1)),
             "test_num_candidates": int(
@@ -1101,6 +1587,9 @@ class VIAIAVModel(object):
             checkpoint["BottleneckAdapter"] = self.BottleneckAdapter.state_dict()
         if self.use_evidence_gate:
             checkpoint["EvidenceFusionGate"] = self.EvidenceFusionGate.state_dict()
+        if self.use_candidate_scorer:
+            checkpoint["CandidateScorer"] = self.CandidateScorer.state_dict()
+            checkpoint["UncertaintyHead"] = self.UncertaintyHead.state_dict()
         if self.use_gan:
             checkpoint["netD"] = self.netD.state_dict()
             checkpoint["optimizer_D"] = (
@@ -1113,6 +1602,10 @@ class VIAIAVModel(object):
         return checkpoint_path
 
     def _stage_name(self):
+        if self.use_candidate_scorer:
+            return "EC-VIAI-AV-stage8-candidate-scorer-calib"
+        if self.use_evidence_gate and self.enable_evidence_scaled_sigma:
+            return "EC-VIAI-AV-stage7d-evidence-scaled-sigma"
         if self.use_evidence_gate and self.freeze_gate_evidence_backbone:
             return "EC-VIAI-AV-stage7c-frozen-evidence-gate"
         if self.use_evidence_gate and (
@@ -1221,6 +1714,25 @@ class VIAIAVModel(object):
                 checkpoint,
                 "EvidenceFusionGate",
                 "EvidenceFusionGate",
+            )
+        if self.CandidateScorer is None:
+            if "CandidateScorer" in checkpoint or "UncertaintyHead" in checkpoint:
+                print(
+                    "[VIAI-AV] checkpoint has candidate scorer weights, but current "
+                    "run does not enable it; skipped scorer weights"
+                )
+        else:
+            self._load_optional_module_state(
+                self.CandidateScorer,
+                checkpoint,
+                "CandidateScorer",
+                "CandidateScorer",
+            )
+            self._load_optional_module_state(
+                self.UncertaintyHead,
+                checkpoint,
+                "UncertaintyHead",
+                "UncertaintyHead",
             )
         checkpoint_stage = checkpoint.get("stage", "unknown")
         self.loaded_stage = self._stage_name()

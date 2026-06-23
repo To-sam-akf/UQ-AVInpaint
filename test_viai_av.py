@@ -45,12 +45,17 @@ RESULT_FIELDS = [
     "deterministic_adapter",
     "enable_evidence_gate",
     "freeze_gate_evidence_backbone",
+    "enable_evidence_scaled_sigma",
+    "enable_candidate_scorer",
     "evidence_source",
     "enable_visual_evidence_aug",
     "visual_evidence_aug_prob",
     "visual_evidence_aug_modes",
     "sigma_min",
     "sigma_max",
+    "evidence_sigma_scale_min",
+    "evidence_sigma_scale_max",
+    "calib_error_tau",
     "save_candidates",
     "video_perturbation",
     "num_samples",
@@ -69,19 +74,36 @@ RESULT_FIELDS = [
     "loss_boundary",
     "loss_evidence_div",
     "loss_gate_evidence",
+    "loss_candidate_scorer",
+    "loss_uncertainty_calib",
+    "loss_calib",
     "loss_multi_candidate",
     "weighted_loss_min_k",
     "weighted_loss_mean_k",
     "weighted_loss_boundary",
     "weighted_loss_evidence_div",
     "weighted_loss_gate_evidence",
+    "weighted_loss_calib",
     "best_of_k_missing_l1",
     "mean_k_missing_l1",
+    "top1_missing_l1",
+    "candidate0_missing_l1",
+    "random_expected_missing_l1",
+    "oracle_gain",
+    "uncertainty_mean",
+    "uncertainty_error_corr",
+    "uncertainty_error_spearman",
+    "uncertainty_best_error_corr",
+    "uncertainty_best_error_spearman",
+    "uncertainty_corr_count",
     "candidate_pairwise_distance",
     "evidence_diversity_gap",
     "gate_mean",
     "gate_target_mean",
     "gate_target_gap",
+    "adapter_sigma_mean",
+    "adapter_sigma_scale_mean",
+    "adapter_effective_sigma_mean",
     "eta1",
     "eta2",
     "lambda_recon",
@@ -174,6 +196,7 @@ def print_viai_av_test_config():
         f"test_num_candidates={getattr(hparams, 'test_num_candidates', 1)} "
         f"stochastic_adapter={getattr(hparams, 'stochastic_adapter', False)} "
         f"deterministic_adapter={getattr(hparams, 'deterministic_adapter', False)} "
+        f"enable_candidate_scorer={getattr(hparams, 'enable_candidate_scorer', False)} "
         f"save_candidates={getattr(hparams, 'save_candidates', False)} "
         f"video_perturbation={getattr(hparams, 'video_perturbation', 'none')}"
     )
@@ -184,9 +207,13 @@ def print_viai_av_test_config():
         f"lambda_boundary={getattr(hparams, 'lambda_boundary', 0.0)} "
         f"lambda_diversity={getattr(hparams, 'lambda_diversity', 0.0)} "
         f"lambda_calib={getattr(hparams, 'lambda_calib', 0.0)} "
+        f"calib_error_tau={getattr(hparams, 'calib_error_tau', 0.1)} "
         f"lambda_gate_evidence={getattr(hparams, 'lambda_gate_evidence', 0.0)} "
         f"enable_evidence_gate={getattr(hparams, 'enable_evidence_gate', False)} "
         f"freeze_gate_evidence_backbone={getattr(hparams, 'freeze_gate_evidence_backbone', False)} "
+        f"enable_evidence_scaled_sigma={getattr(hparams, 'enable_evidence_scaled_sigma', False)} "
+        f"evidence_sigma_scale_min={getattr(hparams, 'evidence_sigma_scale_min', 0.5)} "
+        f"evidence_sigma_scale_max={getattr(hparams, 'evidence_sigma_scale_max', 2.0)} "
         f"evidence_source={getattr(hparams, 'evidence_source', 'none')} "
         f"evidence_diversity_d_min={getattr(hparams, 'evidence_diversity_d_min', 0.02)} "
         f"evidence_diversity_alpha={getattr(hparams, 'evidence_diversity_alpha', 0.08)} "
@@ -261,6 +288,63 @@ def batch_metrics(model):
     }
 
 
+def _rankdata(values):
+    values = np.asarray(values, dtype=np.float64)
+    order = np.argsort(values, kind="mergesort")
+    ranks = np.empty(values.shape[0], dtype=np.float64)
+    sorted_values = values[order]
+    start = 0
+    while start < sorted_values.shape[0]:
+        end = start + 1
+        while end < sorted_values.shape[0] and sorted_values[end] == sorted_values[start]:
+            end += 1
+        ranks[order[start:end]] = 0.5 * (start + end - 1)
+        start = end
+    return ranks
+
+
+def _safe_corr(x_values, y_values, spearman=False):
+    x = np.asarray(x_values, dtype=np.float64).reshape(-1)
+    y = np.asarray(y_values, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(x) & np.isfinite(y)
+    x = x[finite]
+    y = y[finite]
+    count = int(x.shape[0])
+    if count < 2:
+        return 0.0, count
+    if spearman:
+        x = _rankdata(x)
+        y = _rankdata(y)
+    if float(np.std(x)) <= 1e-12 or float(np.std(y)) <= 1e-12:
+        return 0.0, count
+    return float(np.corrcoef(x, y)[0, 1]), count
+
+
+def uncertainty_correlations(uncertainty_values, top1_errors, best_errors):
+    if not uncertainty_values:
+        return {
+            "uncertainty_error_corr": 0.0,
+            "uncertainty_error_spearman": 0.0,
+            "uncertainty_best_error_corr": 0.0,
+            "uncertainty_best_error_spearman": 0.0,
+            "uncertainty_corr_count": 0,
+        }
+    uncertainty = np.concatenate(uncertainty_values, axis=0)
+    top1 = np.concatenate(top1_errors, axis=0)
+    best = np.concatenate(best_errors, axis=0)
+    pearson_top1, count = _safe_corr(uncertainty, top1, spearman=False)
+    spearman_top1, _ = _safe_corr(uncertainty, top1, spearman=True)
+    pearson_best, _ = _safe_corr(uncertainty, best, spearman=False)
+    spearman_best, _ = _safe_corr(uncertainty, best, spearman=True)
+    return {
+        "uncertainty_error_corr": pearson_top1,
+        "uncertainty_error_spearman": spearman_top1,
+        "uncertainty_best_error_corr": pearson_best,
+        "uncertainty_best_error_spearman": spearman_best,
+        "uncertainty_corr_count": count,
+    }
+
+
 def mel_image_output_dir(results_dir, checkpoint_step_value):
     return os.path.join(
         results_dir,
@@ -286,19 +370,31 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "loss_boundary": 0.0,
         "loss_evidence_div": 0.0,
         "loss_gate_evidence": 0.0,
+        "loss_candidate_scorer": 0.0,
+        "loss_uncertainty_calib": 0.0,
+        "loss_calib": 0.0,
         "loss_multi_candidate": 0.0,
         "weighted_loss_min_k": 0.0,
         "weighted_loss_mean_k": 0.0,
         "weighted_loss_boundary": 0.0,
         "weighted_loss_evidence_div": 0.0,
         "weighted_loss_gate_evidence": 0.0,
+        "weighted_loss_calib": 0.0,
         "best_of_k_missing_l1": 0.0,
         "mean_k_missing_l1": 0.0,
+        "top1_missing_l1": 0.0,
+        "candidate0_missing_l1": 0.0,
+        "random_expected_missing_l1": 0.0,
+        "oracle_gain": 0.0,
+        "uncertainty_mean": 0.0,
         "candidate_pairwise_distance": 0.0,
         "evidence_diversity_gap": 0.0,
         "gate_mean": 0.0,
         "gate_target_mean": 0.0,
         "gate_target_gap": 0.0,
+        "adapter_sigma_mean": 0.0,
+        "adapter_sigma_scale_mean": 0.0,
+        "adapter_effective_sigma_mean": 0.0,
         "eta1": 0.0,
         "eta2": 0.0,
         "full_l1": 0.0,
@@ -316,6 +412,9 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
     vocoder_max_samples = getattr(hparams, "vocoder_max_samples", None)
     audio_embeddings = []
     video_embeddings = []
+    uncertainty_values = []
+    top1_error_values = []
+    best_error_values = []
 
     progress = tqdm(
         data_loader,
@@ -350,19 +449,31 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         totals["loss_boundary"] += model.loss_boundary_item
         totals["loss_evidence_div"] += model.loss_evidence_div_item
         totals["loss_gate_evidence"] += model.loss_gate_evidence_item
+        totals["loss_candidate_scorer"] += model.loss_candidate_scorer_item
+        totals["loss_uncertainty_calib"] += model.loss_uncertainty_calib_item
+        totals["loss_calib"] += model.loss_calib_item
         totals["loss_multi_candidate"] += model.loss_multi_candidate_item
         totals["weighted_loss_min_k"] += model.weighted_loss_min_k_item
         totals["weighted_loss_mean_k"] += model.weighted_loss_mean_k_item
         totals["weighted_loss_boundary"] += model.weighted_loss_boundary_item
         totals["weighted_loss_evidence_div"] += model.weighted_loss_evidence_div_item
         totals["weighted_loss_gate_evidence"] += model.weighted_loss_gate_evidence_item
+        totals["weighted_loss_calib"] += model.weighted_loss_calib_item
         totals["best_of_k_missing_l1"] += model.best_of_k_missing_l1_item
         totals["mean_k_missing_l1"] += model.mean_k_missing_l1_item
+        totals["top1_missing_l1"] += model.top1_missing_l1_item
+        totals["candidate0_missing_l1"] += model.candidate0_missing_l1_item
+        totals["random_expected_missing_l1"] += model.random_expected_missing_l1_item
+        totals["oracle_gain"] += model.oracle_gain_item
+        totals["uncertainty_mean"] += model.uncertainty_mean_item
         totals["candidate_pairwise_distance"] += model.candidate_pairwise_distance_item
         totals["evidence_diversity_gap"] += model.evidence_diversity_gap_item
         totals["gate_mean"] += model.gate_mean_item
         totals["gate_target_mean"] += model.gate_target_mean_item
         totals["gate_target_gap"] += model.gate_target_gap_item
+        totals["adapter_sigma_mean"] += model.adapter_sigma_mean_item
+        totals["adapter_sigma_scale_mean"] += model.adapter_sigma_scale_mean_item
+        totals["adapter_effective_sigma_mean"] += model.adapter_effective_sigma_mean_item
         totals["eta1"] += model.eta1_item
         totals["eta2"] += model.eta2_item
         totals["full_l1"] += model.loss_full_l1_item
@@ -374,6 +485,9 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         totals["ssim"] += metrics["ssim"]
         audio_embeddings.append(util.to_np(model.mel_net_norm))
         video_embeddings.append(util.to_np(model.video_net_norm))
+        uncertainty_values.append(util.to_np(model.uncertainty_score.reshape(-1)))
+        top1_error_values.append(util.to_np(model.top1_missing_l1_per_sample.reshape(-1)))
+        best_error_values.append(util.to_np(model.best_of_k_missing_l1_per_sample.reshape(-1)))
         sample_count += batch_size
         batch_count += 1
         if image_dir is not None:
@@ -411,7 +525,9 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
             loss=f"{model.loss_total_item:.4f}",
             recon=f"{model.loss_recon_item:.4f}",
             min_k=f"{model.loss_min_k_item:.4f}",
+            top1=f"{model.top1_missing_l1_item:.4f}",
             mean_k=f"{model.loss_mean_k_item:.4f}",
+            u=f"{model.uncertainty_mean_item:.3f}",
             gate=f"{model.gate_mean_item:.3f}",
             gate_t=f"{model.gate_target_mean_item:.3f}",
             pair=f"{model.candidate_pairwise_distance_item:.4f}",
@@ -429,6 +545,11 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
     video_embeddings = np.concatenate(video_embeddings, axis=0)
     audio_to_video = util.L2retrieval(video_embeddings, audio_embeddings)
     video_to_audio = util.L2retrieval(audio_embeddings, video_embeddings)
+    uncertainty_corrs = uncertainty_correlations(
+        uncertainty_values,
+        top1_error_values,
+        best_error_values,
+    )
     return {
         "loss_total": totals["loss_total"] / batch_count,
         "loss_av_gen": totals["loss_av_gen"] / batch_count,
@@ -445,19 +566,42 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "loss_boundary": totals["loss_boundary"] / batch_count,
         "loss_evidence_div": totals["loss_evidence_div"] / batch_count,
         "loss_gate_evidence": totals["loss_gate_evidence"] / batch_count,
+        "loss_candidate_scorer": totals["loss_candidate_scorer"] / batch_count,
+        "loss_uncertainty_calib": totals["loss_uncertainty_calib"] / batch_count,
+        "loss_calib": totals["loss_calib"] / batch_count,
         "loss_multi_candidate": totals["loss_multi_candidate"] / batch_count,
         "weighted_loss_min_k": totals["weighted_loss_min_k"] / batch_count,
         "weighted_loss_mean_k": totals["weighted_loss_mean_k"] / batch_count,
         "weighted_loss_boundary": totals["weighted_loss_boundary"] / batch_count,
         "weighted_loss_evidence_div": totals["weighted_loss_evidence_div"] / batch_count,
         "weighted_loss_gate_evidence": totals["weighted_loss_gate_evidence"] / batch_count,
+        "weighted_loss_calib": totals["weighted_loss_calib"] / batch_count,
         "best_of_k_missing_l1": totals["best_of_k_missing_l1"] / batch_count,
         "mean_k_missing_l1": totals["mean_k_missing_l1"] / batch_count,
+        "top1_missing_l1": totals["top1_missing_l1"] / batch_count,
+        "candidate0_missing_l1": totals["candidate0_missing_l1"] / batch_count,
+        "random_expected_missing_l1": (
+            totals["random_expected_missing_l1"] / batch_count
+        ),
+        "oracle_gain": totals["oracle_gain"] / batch_count,
+        "uncertainty_mean": totals["uncertainty_mean"] / batch_count,
+        "uncertainty_error_corr": uncertainty_corrs["uncertainty_error_corr"],
+        "uncertainty_error_spearman": uncertainty_corrs["uncertainty_error_spearman"],
+        "uncertainty_best_error_corr": uncertainty_corrs["uncertainty_best_error_corr"],
+        "uncertainty_best_error_spearman": uncertainty_corrs[
+            "uncertainty_best_error_spearman"
+        ],
+        "uncertainty_corr_count": uncertainty_corrs["uncertainty_corr_count"],
         "candidate_pairwise_distance": totals["candidate_pairwise_distance"] / batch_count,
         "evidence_diversity_gap": totals["evidence_diversity_gap"] / batch_count,
         "gate_mean": totals["gate_mean"] / batch_count,
         "gate_target_mean": totals["gate_target_mean"] / batch_count,
         "gate_target_gap": totals["gate_target_gap"] / batch_count,
+        "adapter_sigma_mean": totals["adapter_sigma_mean"] / batch_count,
+        "adapter_sigma_scale_mean": totals["adapter_sigma_scale_mean"] / batch_count,
+        "adapter_effective_sigma_mean": (
+            totals["adapter_effective_sigma_mean"] / batch_count
+        ),
         "eta1": totals["eta1"] / batch_count,
         "eta2": totals["eta2"] / batch_count,
         "mel_l1_full": totals["full_l1"] / batch_count,
@@ -505,6 +649,12 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "freeze_gate_evidence_backbone": bool(
             getattr(hparams, "freeze_gate_evidence_backbone", False)
         ),
+        "enable_evidence_scaled_sigma": bool(
+            getattr(hparams, "enable_evidence_scaled_sigma", False)
+        ),
+        "enable_candidate_scorer": bool(
+            getattr(hparams, "enable_candidate_scorer", False)
+        ),
         "evidence_source": getattr(hparams, "evidence_source", "none"),
         "enable_visual_evidence_aug": bool(
             getattr(hparams, "enable_visual_evidence_aug", False)
@@ -515,6 +665,13 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "visual_evidence_aug_modes": getattr(hparams, "visual_evidence_aug_modes", ""),
         "sigma_min": float(getattr(hparams, "sigma_min", 0.0)),
         "sigma_max": float(getattr(hparams, "sigma_max", 1.0)),
+        "evidence_sigma_scale_min": float(
+            getattr(hparams, "evidence_sigma_scale_min", 0.5)
+        ),
+        "evidence_sigma_scale_max": float(
+            getattr(hparams, "evidence_sigma_scale_max", 2.0)
+        ),
+        "calib_error_tau": float(getattr(hparams, "calib_error_tau", 0.1)),
         "save_candidates": bool(getattr(hparams, "save_candidates", False)),
         "video_perturbation": getattr(hparams, "video_perturbation", "none"),
         "num_samples": int(results["num_samples"]),
@@ -533,19 +690,38 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "loss_boundary": float(results["loss_boundary"]),
         "loss_evidence_div": float(results["loss_evidence_div"]),
         "loss_gate_evidence": float(results["loss_gate_evidence"]),
+        "loss_candidate_scorer": float(results["loss_candidate_scorer"]),
+        "loss_uncertainty_calib": float(results["loss_uncertainty_calib"]),
+        "loss_calib": float(results["loss_calib"]),
         "loss_multi_candidate": float(results["loss_multi_candidate"]),
         "weighted_loss_min_k": float(results["weighted_loss_min_k"]),
         "weighted_loss_mean_k": float(results["weighted_loss_mean_k"]),
         "weighted_loss_boundary": float(results["weighted_loss_boundary"]),
         "weighted_loss_evidence_div": float(results["weighted_loss_evidence_div"]),
         "weighted_loss_gate_evidence": float(results["weighted_loss_gate_evidence"]),
+        "weighted_loss_calib": float(results["weighted_loss_calib"]),
         "best_of_k_missing_l1": float(results["best_of_k_missing_l1"]),
         "mean_k_missing_l1": float(results["mean_k_missing_l1"]),
+        "top1_missing_l1": float(results["top1_missing_l1"]),
+        "candidate0_missing_l1": float(results["candidate0_missing_l1"]),
+        "random_expected_missing_l1": float(results["random_expected_missing_l1"]),
+        "oracle_gain": float(results["oracle_gain"]),
+        "uncertainty_mean": float(results["uncertainty_mean"]),
+        "uncertainty_error_corr": float(results["uncertainty_error_corr"]),
+        "uncertainty_error_spearman": float(results["uncertainty_error_spearman"]),
+        "uncertainty_best_error_corr": float(results["uncertainty_best_error_corr"]),
+        "uncertainty_best_error_spearman": float(
+            results["uncertainty_best_error_spearman"]
+        ),
+        "uncertainty_corr_count": int(results["uncertainty_corr_count"]),
         "candidate_pairwise_distance": float(results["candidate_pairwise_distance"]),
         "evidence_diversity_gap": float(results["evidence_diversity_gap"]),
         "gate_mean": float(results["gate_mean"]),
         "gate_target_mean": float(results["gate_target_mean"]),
         "gate_target_gap": float(results["gate_target_gap"]),
+        "adapter_sigma_mean": float(results["adapter_sigma_mean"]),
+        "adapter_sigma_scale_mean": float(results["adapter_sigma_scale_mean"]),
+        "adapter_effective_sigma_mean": float(results["adapter_effective_sigma_mean"]),
         "eta1": float(results["eta1"]),
         "eta2": float(results["eta2"]),
         "lambda_recon": float(getattr(hparams, "lambda_recon", 1.0)),
@@ -599,6 +775,7 @@ def coerce_csv_record(row):
         "num_candidates",
         "test_num_candidates",
         "num_samples",
+        "uncertainty_corr_count",
         "vocoder_n_iter",
         "vocoder_num_samples",
     }
@@ -618,19 +795,35 @@ def coerce_csv_record(row):
         "loss_boundary",
         "loss_evidence_div",
         "loss_gate_evidence",
+        "loss_candidate_scorer",
+        "loss_uncertainty_calib",
+        "loss_calib",
         "loss_multi_candidate",
         "weighted_loss_min_k",
         "weighted_loss_mean_k",
         "weighted_loss_boundary",
         "weighted_loss_evidence_div",
         "weighted_loss_gate_evidence",
+        "weighted_loss_calib",
         "best_of_k_missing_l1",
         "mean_k_missing_l1",
+        "top1_missing_l1",
+        "candidate0_missing_l1",
+        "random_expected_missing_l1",
+        "oracle_gain",
+        "uncertainty_mean",
+        "uncertainty_error_corr",
+        "uncertainty_error_spearman",
+        "uncertainty_best_error_corr",
+        "uncertainty_best_error_spearman",
         "candidate_pairwise_distance",
         "evidence_diversity_gap",
         "gate_mean",
         "gate_target_mean",
         "gate_target_gap",
+        "adapter_sigma_mean",
+        "adapter_sigma_scale_mean",
+        "adapter_effective_sigma_mean",
         "eta1",
         "eta2",
         "lambda_recon",
@@ -644,6 +837,9 @@ def coerce_csv_record(row):
         "evidence_diversity_alpha",
         "evidence_gate_low",
         "evidence_gate_high",
+        "evidence_sigma_scale_min",
+        "evidence_sigma_scale_max",
+        "calib_error_tau",
         "visual_evidence_aug_prob",
         "sigma_min",
         "sigma_max",
@@ -773,8 +969,18 @@ def main():
         f"boundary={results['loss_boundary']:.6f} "
         f"evidence_div={results['loss_evidence_div']:.6f} "
         f"gate_ev={results['loss_gate_evidence']:.6f} "
+        f"scorer={results['loss_candidate_scorer']:.6f} "
+        f"unc_calib={results['loss_uncertainty_calib']:.6f} "
+        f"calib={results['loss_calib']:.6f} "
         f"multi={results['loss_multi_candidate']:.6f} "
         f"best_of_k={results['best_of_k_missing_l1']:.6f} "
+        f"top1={results['top1_missing_l1']:.6f} "
+        f"candidate0={results['candidate0_missing_l1']:.6f} "
+        f"random={results['random_expected_missing_l1']:.6f} "
+        f"oracle_gain={results['oracle_gain']:.6f} "
+        f"uncertainty={results['uncertainty_mean']:.6f} "
+        f"u_top1_corr={results['uncertainty_error_corr']:.6f} "
+        f"u_top1_spearman={results['uncertainty_error_spearman']:.6f} "
         f"pairwise={results['candidate_pairwise_distance']:.6f} "
         f"div_gap={results['evidence_diversity_gap']:.6f} "
         f"gate_mean={results['gate_mean']:.6f} "

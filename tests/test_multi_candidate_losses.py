@@ -3,6 +3,7 @@ import sys
 from types import SimpleNamespace
 
 import torch
+import torch.nn.functional as F
 
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -10,6 +11,7 @@ if ROOT not in sys.path:
     sys.path.insert(0, ROOT)
 
 from Models.VIAI_AV_inpainting import VIAIAVModel
+from networks.EC_VIAI_Modules import CandidateScorer, UncertaintyHead
 
 
 def _build_mask(batch_size, mel_bins, mel_steps, span):
@@ -68,6 +70,10 @@ def test_best_of_k_and_mean_k_missing_l1():
     assert torch.isfinite(model.loss_mean_k)
     assert model.loss_min_k < model.loss_mean_k
     assert model.best_of_k_missing_l1 <= model.mean_k_missing_l1
+    assert model.oracle_gain >= 0.0
+    assert model.best_of_k_missing_l1 <= model.top1_missing_l1
+    assert model.best_of_k_missing_l1 <= model.candidate0_missing_l1
+    assert model.best_of_k_missing_l1 <= model.random_expected_missing_l1
 
     single_model = _make_loss_model(candidates[:, :1], target, mask, (3, 7))
     single_model._multi_candidate_losses()
@@ -116,6 +122,69 @@ def test_boundary_loss_skips_out_of_range_edges():
         assert torch.isfinite(model.loss_multi_candidate)
 
 
+def test_candidate_scorer_outputs_distribution_and_argmax_anchor():
+    torch.manual_seed(17)
+    scorer = CandidateScorer(feature_channels=4, candidate_stat_dim=3, hidden_channels=8)
+    candidate_stats = torch.randn(2, 4, 3)
+    audio_bottleneck = torch.randn(2, 4, 1, 5)
+    video_feature = torch.randn(2, 4, 1, 5)
+    evidence = torch.tensor([[0.8], [0.2]])
+
+    logits, pi = scorer(candidate_stats, audio_bottleneck, video_feature, evidence)
+
+    assert tuple(logits.shape) == (2, 4)
+    assert tuple(pi.shape) == (2, 4)
+    assert torch.allclose(pi.sum(dim=1), torch.ones(2), atol=1e-6)
+    assert torch.equal(torch.argmax(pi, dim=1), torch.zeros(2, dtype=torch.long))
+
+
+def test_uncertainty_head_outputs_bounded_sample_score():
+    torch.manual_seed(23)
+    head = UncertaintyHead(feature_channels=4, stats_dim=7, hidden_channels=8)
+    audio_bottleneck = torch.randn(2, 4, 1, 5)
+    video_feature = torch.randn(2, 4, 1, 5)
+    uncertainty_stats = torch.randn(2, 7)
+
+    uncertainty = head(audio_bottleneck, video_feature, uncertainty_stats)
+
+    assert tuple(uncertainty.shape) == (2, 1)
+    assert bool(torch.all(uncertainty >= 0.0) and torch.all(uncertainty <= 1.0))
+
+
+def test_calibration_loss_targets_true_best_candidate():
+    model = object.__new__(VIAIAVModel)
+    model.hparams = SimpleNamespace(lambda_calib=0.5, calib_error_tau=0.1)
+    model.use_candidate_scorer = True
+    model.criterion_uncertainty_calib = torch.nn.SmoothL1Loss()
+    model.candidate_missing_l1 = torch.tensor(
+        [[0.5, 0.1, 0.2], [0.3, 0.4, 0.1]],
+        dtype=torch.float32,
+    )
+    model.candidate_logits = torch.tensor(
+        [[0.1, 0.8, 0.2], [0.2, 0.0, 0.9]],
+        dtype=torch.float32,
+    )
+    model.uncertainty_score = torch.full((2, 1), 0.5)
+
+    model._calibration_losses()
+
+    expected_targets = torch.tensor([1, 2])
+    expected_ce = F.cross_entropy(model.candidate_logits, expected_targets)
+    assert torch.allclose(model.loss_candidate_scorer, expected_ce)
+    assert model.loss_calib.item() > 0.0
+    assert torch.allclose(model.weighted_loss_calib, 0.5 * model.loss_calib)
+
+    model.hparams.lambda_calib = 0.0
+    model._calibration_losses()
+    assert torch.allclose(
+        model.weighted_loss_calib,
+        torch.zeros_like(model.weighted_loss_calib),
+    )
+
+
 if __name__ == "__main__":
     test_best_of_k_and_mean_k_missing_l1()
     test_boundary_loss_skips_out_of_range_edges()
+    test_candidate_scorer_outputs_distribution_and_argmax_anchor()
+    test_uncertainty_head_outputs_bounded_sample_score()
+    test_calibration_loss_targets_true_best_candidate()

@@ -170,6 +170,11 @@ class BaseOptions(object):
         self.parser.add_argument("--deterministic_adapter", action="store_true")
         self.parser.add_argument("--enable_evidence_gate", action="store_true")
         self.parser.add_argument("--freeze_gate_evidence_backbone", action="store_true")
+        self.parser.add_argument("--enable_evidence_scaled_sigma", action="store_true")
+        self.parser.add_argument("--enable_candidate_scorer", action="store_true")
+        self.parser.add_argument("--calib_error_tau", type=float, default=0.1)
+        self.parser.add_argument("--evidence_sigma_scale_min", type=float, default=0.5)
+        self.parser.add_argument("--evidence_sigma_scale_max", type=float, default=2.0)
         self.parser.add_argument("--evidence_source", type=str, default="none")
         self.parser.add_argument("--evidence_diversity_d_min", type=float, default=0.02)
         self.parser.add_argument("--evidence_diversity_alpha", type=float, default=0.08)
@@ -314,8 +319,27 @@ class BaseOptions(object):
             self.parser.error("--evidence_diversity_alpha must be >= 0.")
         if opt.lambda_gate_evidence < 0:
             self.parser.error("--lambda_gate_evidence must be >= 0.")
+        if opt.lambda_calib < 0:
+            self.parser.error("--lambda_calib must be >= 0.")
+        if opt.lambda_calib > 0 and not opt.enable_candidate_scorer:
+            self.parser.error("--lambda_calib > 0 requires --enable_candidate_scorer.")
+        if opt.enable_candidate_scorer and not (
+            opt.enable_ec_viai_av and opt.stochastic_adapter
+        ):
+            self.parser.error(
+                "--enable_candidate_scorer requires "
+                "--enable_ec_viai_av --stochastic_adapter."
+            )
+        if opt.calib_error_tau <= 0:
+            self.parser.error("--calib_error_tau must be > 0.")
         if opt.evidence_gate_high <= opt.evidence_gate_low:
             self.parser.error("--evidence_gate_high must be > --evidence_gate_low.")
+        if opt.evidence_sigma_scale_min < 0:
+            self.parser.error("--evidence_sigma_scale_min must be >= 0.")
+        if opt.evidence_sigma_scale_max < opt.evidence_sigma_scale_min:
+            self.parser.error(
+                "--evidence_sigma_scale_max must be >= --evidence_sigma_scale_min."
+            )
         if opt.visual_evidence_aug_prob < 0 or opt.visual_evidence_aug_prob > 1:
             self.parser.error("--visual_evidence_aug_prob must be in [0, 1].")
         valid_aug_modes = {

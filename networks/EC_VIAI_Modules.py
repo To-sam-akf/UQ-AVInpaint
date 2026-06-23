@@ -187,6 +187,119 @@ class EvidenceFusionGate(nn.Module):
         return calibrated_video, gate, audio_prior
 
 
+class CandidateScorer(nn.Module):
+    """Score K inpainting candidates with test-time-safe proxy features."""
+
+    def __init__(self, feature_channels=256, candidate_stat_dim=3, hidden_channels=256):
+        super(CandidateScorer, self).__init__()
+        self.feature_channels = int(feature_channels)
+        self.candidate_stat_dim = int(candidate_stat_dim)
+        self.hidden_channels = int(hidden_channels)
+        self.scorer = nn.Sequential(
+            nn.Linear(self.feature_channels * 2 + self.candidate_stat_dim + 1, self.hidden_channels),
+            nn.ReLU(True),
+            nn.Linear(self.hidden_channels, self.hidden_channels),
+            nn.ReLU(True),
+            nn.Linear(self.hidden_channels, 1),
+        )
+        self.initial()
+
+    def initial(self):
+        linear_layers = [module for module in self.scorer.modules() if isinstance(module, nn.Linear)]
+        for module in linear_layers[:-1]:
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+        last = linear_layers[-1]
+        nn.init.constant_(last.weight, 0.0)
+        if last.bias is not None:
+            nn.init.constant_(last.bias, 0.0)
+
+    def _pool_feature(self, feature):
+        if feature.dim() != 4:
+            raise ValueError("feature must be a 4D tensor.")
+        return F.adaptive_avg_pool2d(feature, output_size=1).flatten(1)
+
+    def forward(self, candidate_stats, audio_bottleneck, video_feature, evidence):
+        if candidate_stats.dim() != 3:
+            raise ValueError("candidate_stats must have shape [B, K, S].")
+        batch_size, num_candidates, stat_dim = candidate_stats.shape
+        if stat_dim != self.candidate_stat_dim:
+            raise ValueError(
+                f"Expected candidate_stats dim {self.candidate_stat_dim}, got {stat_dim}."
+            )
+
+        audio_pool = self._pool_feature(audio_bottleneck)
+        video_pool = self._pool_feature(video_feature)
+        evidence = evidence.to(device=candidate_stats.device, dtype=candidate_stats.dtype)
+        evidence = evidence.reshape(batch_size, -1)
+        if evidence.size(1) != 1:
+            evidence = evidence.mean(dim=1, keepdim=True)
+
+        audio_pool = audio_pool.unsqueeze(1).expand(-1, num_candidates, -1)
+        video_pool = video_pool.unsqueeze(1).expand(-1, num_candidates, -1)
+        evidence = evidence.unsqueeze(1).expand(-1, num_candidates, -1)
+        scorer_input = torch.cat(
+            [
+                candidate_stats,
+                audio_pool.to(dtype=candidate_stats.dtype),
+                video_pool.to(dtype=candidate_stats.dtype),
+                evidence,
+            ],
+            dim=2,
+        )
+        logits = self.scorer(scorer_input.reshape(batch_size * num_candidates, -1))
+        logits = logits.reshape(batch_size, num_candidates)
+        pi = F.softmax(logits, dim=1)
+        return logits, pi
+
+
+class UncertaintyHead(nn.Module):
+    """Predict sample-level uncertainty from pooled context and scorer statistics."""
+
+    def __init__(self, feature_channels=256, stats_dim=7, hidden_channels=256):
+        super(UncertaintyHead, self).__init__()
+        self.feature_channels = int(feature_channels)
+        self.stats_dim = int(stats_dim)
+        self.hidden_channels = int(hidden_channels)
+        self.head = nn.Sequential(
+            nn.Linear(self.feature_channels * 2 + self.stats_dim, self.hidden_channels),
+            nn.ReLU(True),
+            nn.Linear(self.hidden_channels, self.hidden_channels),
+            nn.ReLU(True),
+            nn.Linear(self.hidden_channels, 1),
+        )
+        self.initial()
+
+    def initial(self):
+        linear_layers = [module for module in self.head.modules() if isinstance(module, nn.Linear)]
+        for module in linear_layers[:-1]:
+            nn.init.xavier_uniform_(module.weight)
+            if module.bias is not None:
+                nn.init.constant_(module.bias, 0.0)
+        last = linear_layers[-1]
+        nn.init.constant_(last.weight, 0.0)
+        if last.bias is not None:
+            nn.init.constant_(last.bias, 0.0)
+
+    def _pool_feature(self, feature):
+        if feature.dim() != 4:
+            raise ValueError("feature must be a 4D tensor.")
+        return F.adaptive_avg_pool2d(feature, output_size=1).flatten(1)
+
+    def forward(self, audio_bottleneck, video_feature, uncertainty_stats):
+        if uncertainty_stats.dim() != 2:
+            raise ValueError("uncertainty_stats must have shape [B, S].")
+        if uncertainty_stats.size(1) != self.stats_dim:
+            raise ValueError(
+                f"Expected uncertainty_stats dim {self.stats_dim}, got {uncertainty_stats.size(1)}."
+            )
+        audio_pool = self._pool_feature(audio_bottleneck).to(dtype=uncertainty_stats.dtype)
+        video_pool = self._pool_feature(video_feature).to(dtype=uncertainty_stats.dtype)
+        head_input = torch.cat([audio_pool, video_pool, uncertainty_stats], dim=1)
+        return torch.sigmoid(self.head(head_input))
+
+
 class BottleneckAdapter(nn.Module):
     """Residual adapter for deterministic and stochastic VIAI-AV bottlenecks."""
 
@@ -275,7 +388,15 @@ class BottleneckAdapter(nn.Module):
         logvar = self.logvar_head(bottleneck_input).clamp(min=-10.0, max=2.0)
         return mu, logvar
 
-    def sample_latent(self, mu, logvar, num_candidates, sigma_min=0.0, sigma_max=1.0):
+    def sample_latent(
+        self,
+        mu,
+        logvar,
+        num_candidates,
+        sigma_min=0.0,
+        sigma_max=1.0,
+        sigma_scale=None,
+    ):
         num_candidates = int(num_candidates)
         if num_candidates < 1:
             raise ValueError("num_candidates must be >= 1.")
@@ -287,6 +408,20 @@ class BottleneckAdapter(nn.Module):
             raise ValueError("sigma_max must be >= sigma_min.")
 
         sigma = torch.exp(0.5 * logvar)
+        if sigma_scale is not None:
+            sigma_scale = sigma_scale.to(device=mu.device, dtype=mu.dtype)
+            if sigma_scale.dim() == 1:
+                sigma_scale = sigma_scale.view(-1, 1, 1, 1)
+            elif sigma_scale.dim() == 2:
+                sigma_scale = sigma_scale.view(sigma_scale.size(0), -1, 1, 1)
+            if sigma_scale.size(0) != mu.size(0):
+                raise ValueError(
+                    "sigma_scale batch size must match mu batch size; got "
+                    f"{sigma_scale.size(0)} and {mu.size(0)}."
+                )
+            if sigma_scale.size(1) != 1:
+                sigma_scale = sigma_scale.mean(dim=1, keepdim=True)
+            sigma = sigma * sigma_scale
         sigma = torch.clamp(sigma, min=sigma_min, max=sigma_max)
         eps = torch.randn(
             mu.size(0),
@@ -329,6 +464,7 @@ class BottleneckAdapter(nn.Module):
         num_candidates,
         sigma_min=0.0,
         sigma_max=1.0,
+        sigma_scale=None,
     ):
         mu, logvar = self.latent_parameters(mel_bottleneck, video_feature)
         z, sigma = self.sample_latent(
@@ -337,6 +473,7 @@ class BottleneckAdapter(nn.Module):
             num_candidates,
             sigma_min=sigma_min,
             sigma_max=sigma_max,
+            sigma_scale=sigma_scale,
         )
         residual = self.sample_adapter(z)
         return residual, mu, logvar, sigma

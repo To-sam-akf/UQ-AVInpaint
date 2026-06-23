@@ -30,6 +30,9 @@ METRIC_NAMES = [
     "gate_gap",
     "candidate_pairwise_distance",
     "evidence_diversity_gap",
+    "adapter_sigma_mean",
+    "sigma_scale_mean",
+    "effective_sigma_mean",
 ]
 
 
@@ -54,6 +57,11 @@ def parse_args():
     parser.add_argument("--evidence_gate_low", type=float, default=0.24)
     parser.add_argument("--evidence_gate_high", type=float, default=0.34)
     parser.add_argument("--freeze_gate_evidence_backbone", action="store_true")
+    parser.add_argument("--enable_evidence_scaled_sigma", action="store_true")
+    parser.add_argument("--evidence_sigma_scale_min", type=float, default=0.5)
+    parser.add_argument("--evidence_sigma_scale_max", type=float, default=2.0)
+    parser.add_argument("--sigma_min", type=float, default=0.0)
+    parser.add_argument("--sigma_max", type=float, default=1.0)
     return parser.parse_args()
 
 
@@ -162,6 +170,9 @@ def evaluate_condition(model, batch, label, seed, blank_frames):
         "gate_gap": model.gate_target_gap_item,
         "candidate_pairwise_distance": model.candidate_pairwise_distance_item,
         "evidence_diversity_gap": model.evidence_diversity_gap_item,
+        "adapter_sigma_mean": model.adapter_sigma_mean_item,
+        "sigma_scale_mean": model.adapter_sigma_scale_mean_item,
+        "effective_sigma_mean": model.adapter_effective_sigma_mean_item,
         "path": model.path_batch[0],
     }
 
@@ -179,6 +190,9 @@ def print_single_anchor(records_by_condition):
             f"gate_gap={record['gate_gap']:.6f} "
             f"candidate_pairwise_distance={record['candidate_pairwise_distance']:.6f} "
             f"evidence_diversity_gap={record['evidence_diversity_gap']:.6f} "
+            f"adapter_sigma_mean={record['adapter_sigma_mean']:.6f} "
+            f"sigma_scale_mean={record['sigma_scale_mean']:.6f} "
+            f"effective_sigma_mean={record['effective_sigma_mean']:.6f} "
             f"path={record['path']}"
         )
 
@@ -259,6 +273,27 @@ def summarize(anchor_results):
         "candidate_pairwise_distance",
     )
     paired_check(
+        "sigma_scale_original_lt_flow_25",
+        "original",
+        "flow_25",
+        "sigma_scale_mean",
+        direction="lt",
+    )
+    paired_check(
+        "sigma_scale_flow_25_lt_flow_zero",
+        "flow_25",
+        "flow_zero",
+        "sigma_scale_mean",
+        direction="lt",
+    )
+    paired_check(
+        "sigma_scale_flow_25_lt_static_video_zero_flow",
+        "flow_25",
+        "static_video_zero_flow",
+        "sigma_scale_mean",
+        direction="lt",
+    )
+    paired_check(
         "evidence_original_gt_wrong_video_observation",
         "original",
         "wrong_video",
@@ -302,11 +337,21 @@ def main():
         str(args.evidence_gate_low),
         "--evidence_gate_high",
         str(args.evidence_gate_high),
+        "--sigma_min",
+        str(args.sigma_min),
+        "--sigma_max",
+        str(args.sigma_max),
+        "--evidence_sigma_scale_min",
+        str(args.evidence_sigma_scale_min),
+        "--evidence_sigma_scale_max",
+        str(args.evidence_sigma_scale_max),
     ]
     if args.use_gan:
         hparam_args.append("--use_gan")
     if args.freeze_gate_evidence_backbone:
         hparam_args.append("--freeze_gate_evidence_backbone")
+    if args.enable_evidence_scaled_sigma:
+        hparam_args.append("--enable_evidence_scaled_sigma")
     hparams = Options_inpainting.Inpainting_Config(force_reload=True, args=hparam_args)
 
     from Data_loaders import audio_loader as av_loader
