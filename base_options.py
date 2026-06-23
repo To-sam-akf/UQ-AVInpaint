@@ -135,6 +135,12 @@ class BaseOptions(object):
         )
         self.parser.add_argument("--lambda_sync", type=float, default=1.0)
         self.parser.add_argument("--lambda_probe", type=float, default=1.0)
+        self.parser.add_argument("--lambda_min_k", type=float, default=0.0)
+        self.parser.add_argument("--lambda_mean_k", type=float, default=0.0)
+        self.parser.add_argument("--lambda_boundary", type=float, default=0.0)
+        self.parser.add_argument("--lambda_diversity", type=float, default=0.0)
+        self.parser.add_argument("--lambda_calib", type=float, default=0.0)
+        self.parser.add_argument("--lambda_gate_evidence", type=float, default=0.0)
         self.parser.add_argument("--sync_margin", type=float, default=1.0)
         self.parser.add_argument(
             "--disable_sync_loss",
@@ -155,6 +161,32 @@ class BaseOptions(object):
         self.parser.add_argument("--probe_decay_base", type=float, default=None)
         self.parser.add_argument("--probe_decay_interval", type=float, default=None)
         self.parser.add_argument("--probe_decay_floor", type=float, default=None)
+
+        # Evidence-Calibrated VIAI-AV switches. These are no-op configuration
+        # hooks until the EC modules are implemented in later stages.
+        self.parser.add_argument("--enable_ec_viai_av", action="store_true")
+        self.parser.add_argument("--num_candidates", type=int, default=1)
+        self.parser.add_argument("--stochastic_adapter", action="store_true")
+        self.parser.add_argument("--deterministic_adapter", action="store_true")
+        self.parser.add_argument("--enable_evidence_gate", action="store_true")
+        self.parser.add_argument("--freeze_gate_evidence_backbone", action="store_true")
+        self.parser.add_argument("--evidence_source", type=str, default="none")
+        self.parser.add_argument("--evidence_diversity_d_min", type=float, default=0.02)
+        self.parser.add_argument("--evidence_diversity_alpha", type=float, default=0.08)
+        self.parser.add_argument("--evidence_gate_low", type=float, default=0.24)
+        self.parser.add_argument("--evidence_gate_high", type=float, default=0.34)
+        self.parser.add_argument("--enable_visual_evidence_aug", action="store_true")
+        self.parser.add_argument("--visual_evidence_aug_prob", type=float, default=0.5)
+        self.parser.add_argument(
+            "--visual_evidence_aug_modes",
+            type=str,
+            default="flow_75,flow_50,flow_25,flow_zero,static_video_zero_flow",
+        )
+        self.parser.add_argument("--sigma_min", type=float, default=0.0)
+        self.parser.add_argument("--sigma_max", type=float, default=1.0)
+        self.parser.add_argument("--test_num_candidates", type=int, default=None)
+        self.parser.add_argument("--save_candidates", action="store_true")
+        self.parser.add_argument("--video_perturbation", type=str, default="none")
 
         # Missing-region setup (4s inputs, 0.4s~1.0s gaps)
         self.parser.add_argument("--max_time_sec", type=float, default=None)
@@ -265,6 +297,51 @@ class BaseOptions(object):
 
     def parse(self, args=None):
         opt = self.gather_options(args=args)
+
+        if opt.test_num_candidates is None:
+            opt.test_num_candidates = opt.num_candidates
+        if opt.num_candidates < 1:
+            self.parser.error("--num_candidates must be >= 1.")
+        if opt.test_num_candidates < 1:
+            self.parser.error("--test_num_candidates must be >= 1.")
+        if opt.sigma_min < 0:
+            self.parser.error("--sigma_min must be >= 0.")
+        if opt.sigma_max < opt.sigma_min:
+            self.parser.error("--sigma_max must be >= --sigma_min.")
+        if opt.evidence_diversity_d_min < 0:
+            self.parser.error("--evidence_diversity_d_min must be >= 0.")
+        if opt.evidence_diversity_alpha < 0:
+            self.parser.error("--evidence_diversity_alpha must be >= 0.")
+        if opt.lambda_gate_evidence < 0:
+            self.parser.error("--lambda_gate_evidence must be >= 0.")
+        if opt.evidence_gate_high <= opt.evidence_gate_low:
+            self.parser.error("--evidence_gate_high must be > --evidence_gate_low.")
+        if opt.visual_evidence_aug_prob < 0 or opt.visual_evidence_aug_prob > 1:
+            self.parser.error("--visual_evidence_aug_prob must be in [0, 1].")
+        valid_aug_modes = {
+            "flow_75",
+            "flow_50",
+            "flow_25",
+            "flow_zero",
+            "static_video_zero_flow",
+        }
+        visual_aug_modes = [
+            mode.strip()
+            for mode in str(opt.visual_evidence_aug_modes).split(",")
+            if mode.strip()
+        ]
+        if not visual_aug_modes:
+            self.parser.error("--visual_evidence_aug_modes must include at least one mode.")
+        invalid_aug_modes = [mode for mode in visual_aug_modes if mode not in valid_aug_modes]
+        if invalid_aug_modes:
+            self.parser.error(
+                "--visual_evidence_aug_modes contains unsupported modes: "
+                + ", ".join(invalid_aug_modes)
+            )
+        if opt.stochastic_adapter and opt.deterministic_adapter:
+            self.parser.error(
+                "--stochastic_adapter and --deterministic_adapter cannot both be enabled."
+            )
 
         if opt.beta_recon is None:
             opt.beta_recon = opt.lambda_recon

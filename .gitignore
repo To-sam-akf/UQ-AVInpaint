@@ -21,4 +21,5 @@ checkpoints/
 
 thought/
 
-logmd/
+logmd/.claude/settings.local.json
+.claude/settings.local.json

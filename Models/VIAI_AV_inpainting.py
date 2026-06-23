@@ -7,6 +7,7 @@ import torch.nn as nn
 from Data_loaders import mel_loader
 from loss_functions import GANLoss, L2ContrastiveLoss
 from networks import Discriminator_Networks
+from networks import EC_VIAI_Modules
 from networks import Image_Embedding
 from networks import Inpainting_Networks
 from networks import New_Inpainting_Networks
@@ -38,13 +39,77 @@ class VIAIAVModel(object):
         self.use_gan = bool(getattr(hparams, "use_gan", False))
         self.enable_sync_loss = not bool(getattr(hparams, "disable_sync_loss", False))
         self.enable_probe_loss = not bool(getattr(hparams, "disable_probe_loss", False))
+        self.enable_ec_viai_av = bool(getattr(hparams, "enable_ec_viai_av", False))
+        self.use_deterministic_adapter = self.enable_ec_viai_av and bool(
+            getattr(hparams, "deterministic_adapter", False)
+        )
+        self.use_stochastic_adapter = self.enable_ec_viai_av and bool(
+            getattr(hparams, "stochastic_adapter", False)
+        )
+        self.use_evidence_gate = self.enable_ec_viai_av and bool(
+            getattr(hparams, "enable_evidence_gate", False)
+        )
+        self.freeze_gate_evidence_backbone = bool(
+            getattr(hparams, "freeze_gate_evidence_backbone", False)
+        )
+        self.enable_visual_evidence_aug = bool(
+            getattr(hparams, "enable_visual_evidence_aug", False)
+        )
+        self.visual_evidence_aug_modes = (
+            EC_VIAI_Modules.normalize_visual_evidence_aug_modes(
+                getattr(
+                    hparams,
+                    "visual_evidence_aug_modes",
+                    "flow_75,flow_50,flow_25,flow_zero,static_video_zero_flow",
+                )
+            )
+        )
+        if self.use_deterministic_adapter and self.use_stochastic_adapter:
+            raise ValueError(
+                "--stochastic_adapter and --deterministic_adapter cannot both be enabled."
+            )
+        self.train_num_candidates = int(getattr(hparams, "num_candidates", 1))
+        self.test_num_candidates = int(
+            getattr(hparams, "test_num_candidates", self.train_num_candidates)
+        )
+        if self.train_num_candidates < 1 or self.test_num_candidates < 1:
+            raise ValueError("num_candidates and test_num_candidates must be >= 1.")
+        if not self.use_stochastic_adapter and (
+            self.train_num_candidates > 1 or self.test_num_candidates > 1
+        ):
+            raise ValueError(
+                "num_candidates > 1 or test_num_candidates > 1 requires "
+                "--enable_ec_viai_av --stochastic_adapter."
+            )
+        lambda_diversity = float(getattr(hparams, "lambda_diversity", 0.0))
+        if lambda_diversity > 0.0 and (
+            self.train_num_candidates < 2 or self.test_num_candidates < 2
+        ):
+            raise ValueError(
+                "--lambda_diversity > 0 requires num_candidates and "
+                "test_num_candidates to be >= 2."
+            )
+        self.current_num_candidates = self.train_num_candidates
+        self.use_bottleneck_adapter = (
+            self.use_deterministic_adapter or self.use_stochastic_adapter
+        )
 
         self.Mel_Encoder = Inpainting_Networks.MelEncoder(hparams=hparams).to(self.device)
         self.VideoEncoder = Image_Embedding.ImageEmbedding(hparams=hparams).to(self.device)
         self.Mel_Decoder = New_Inpainting_Networks.MelDecoderImage(hparams=hparams).to(self.device)
+        self.EvidenceEstimator = EC_VIAI_Modules.VisualEvidenceEstimator().to(self.device)
         self.netD = None
         if self.use_gan:
             self.netD = Discriminator_Networks.MelDiscriminator().to(self.device)
+        self.BottleneckAdapter = None
+        if self.use_bottleneck_adapter:
+            self.BottleneckAdapter = EC_VIAI_Modules.BottleneckAdapter().to(self.device)
+        self.EvidenceFusionGate = None
+        if self.use_evidence_gate:
+            self.EvidenceFusionGate = EC_VIAI_Modules.EvidenceFusionGate().to(self.device)
+        if self.freeze_gate_evidence_backbone:
+            self._set_module_requires_grad(self.Mel_Encoder, False)
+            self._set_module_requires_grad(self.VideoEncoder, False)
 
         self.criterion_l1 = nn.L1Loss()
         self.criterion_gan = GANLoss(use_lsgan=False, device=self.device) if self.use_gan else None
@@ -52,12 +117,17 @@ class VIAIAVModel(object):
             margin=getattr(hparams, "sync_margin", 1.0),
             max_violation=False,
         )
+        self.criterion_gate_evidence = nn.SmoothL1Loss()
 
-        generator_params = (
-            list(self.Mel_Encoder.parameters())
-            + list(self.VideoEncoder.parameters())
-            + list(self.Mel_Decoder.parameters())
-        )
+        generator_params = []
+        if not self.freeze_gate_evidence_backbone:
+            generator_params += list(self.Mel_Encoder.parameters())
+            generator_params += list(self.VideoEncoder.parameters())
+        generator_params += list(self.Mel_Decoder.parameters())
+        if self.use_bottleneck_adapter:
+            generator_params += list(self.BottleneckAdapter.parameters())
+        if self.use_evidence_gate:
+            generator_params += list(self.EvidenceFusionGate.parameters())
         self.optimizer_G = torch.optim.Adam(
             generator_params,
             lr=hparams.lr,
@@ -88,12 +158,89 @@ class VIAIAVModel(object):
         self.loss_probe_missing_l1_item = 0.0
         self.loss_probe_G_GAN_item = 0.0
         self.weighted_loss_probe_gen_item = 0.0
+        self.loss_anchor_item = 0.0
+        self.loss_min_k_item = 0.0
+        self.loss_mean_k_item = 0.0
+        self.loss_boundary_item = 0.0
+        self.loss_evidence_div_item = 0.0
+        self.loss_gate_evidence_item = 0.0
+        self.loss_multi_candidate_item = 0.0
+        self.weighted_loss_min_k_item = 0.0
+        self.weighted_loss_mean_k_item = 0.0
+        self.weighted_loss_boundary_item = 0.0
+        self.weighted_loss_evidence_div_item = 0.0
+        self.weighted_loss_gate_evidence_item = 0.0
+        self.best_of_k_missing_l1_item = 0.0
+        self.mean_k_missing_l1_item = 0.0
         self.loss_D_item = 0.0
         self.loss_D_real_item = 0.0
         self.loss_D_fake_item = 0.0
         self.eta1_item = 0.0
         self.eta2_item = 0.0
+        self.evidence_score = torch.zeros(1, 1, device=self.device)
+        self.evidence_mean_item = 0.0
+        self.evidence_min_item = 0.0
+        self.evidence_max_item = 0.0
+        self.gate_value = torch.ones(1, 1, 1, 1, device=self.device)
+        self.gate_target = torch.ones(1, 1, 1, 1, device=self.device)
+        self.gate_mean_item = 1.0
+        self.gate_min_item = 1.0
+        self.gate_max_item = 1.0
+        self.gate_target_mean_item = 1.0
+        self.gate_target_gap_item = 0.0
+        self.visual_evidence_aug_mode = "none"
+        self.visual_evidence_aug_applied_item = 0.0
+        self.visual_evidence_aug_mode_items = {
+            "none": 1.0,
+            "flow_75": 0.0,
+            "flow_50": 0.0,
+            "flow_25": 0.0,
+            "flow_zero": 0.0,
+            "static_video_zero_flow": 0.0,
+        }
+        self.audio_prior_feature = torch.zeros(1, 256, 1, 1, device=self.device)
+        self.calibrated_video_feature = torch.zeros(1, 256, 1, 1, device=self.device)
+        self.adapter_residual = torch.zeros(1, 256, 1, 1, device=self.device)
+        self.adapter_scale_item = 0.0
+        self.adapter_stochastic_scale_item = 0.0
+        self.adapter_residual_l1_item = 0.0
+        self.adapter_logvar = torch.zeros(1, 256, 1, 1, device=self.device)
+        self.adapter_sigma = torch.zeros(1, 256, 1, 1, device=self.device)
+        self.adapter_logvar_mean_item = 0.0
+        self.adapter_sigma_mean_item = 0.0
+        self.candidate_pairwise_distance_per_sample = torch.zeros(1, device=self.device)
+        self.candidate_pairwise_distance = torch.zeros((), device=self.device)
+        self.candidate_pairwise_distance_item = 0.0
+        self.evidence_diversity_target = torch.zeros(1, 1, device=self.device)
+        self.evidence_diversity_gap = torch.zeros((), device=self.device)
+        self.evidence_diversity_gap_item = 0.0
+        self.candidate_pairwise_l1 = torch.zeros((), device=self.device)
+        self.candidate_pairwise_l1_item = 0.0
+        mel_height = int(getattr(hparams, "cin_channels", 80))
+        mel_width = int(getattr(hparams, "max_mel_lengths", 200))
+        self.mel_candidates = torch.zeros(1, 1, 1, mel_height, mel_width, device=self.device)
+        self.mel_completed_candidates = torch.zeros_like(self.mel_candidates)
+        self.mel_completed_pred = torch.zeros(1, 1, mel_height, mel_width, device=self.device)
+        self.loaded_stage = self._stage_name()
+        setattr(self.hparams, "loaded_stage", self.loaded_stage)
         self._print_loss_configuration()
+
+    def _set_module_requires_grad(self, module, requires_grad):
+        for parameter in module.parameters():
+            parameter.requires_grad = requires_grad
+
+    def _set_generator_train_modes(self):
+        if self.freeze_gate_evidence_backbone:
+            self.Mel_Encoder.eval()
+            self.VideoEncoder.eval()
+        else:
+            self.Mel_Encoder.train()
+            self.VideoEncoder.train()
+        self.Mel_Decoder.train()
+        if self.use_bottleneck_adapter:
+            self.BottleneckAdapter.train()
+        if self.use_evidence_gate:
+            self.EvidenceFusionGate.train()
 
     def _print_loss_configuration(self):
         lambda_gan = getattr(self.hparams, "lambda_gan", 1.0)
@@ -110,6 +257,18 @@ class VIAIAVModel(object):
             f"enable_sync_loss={self.enable_sync_loss} "
             f"enable_probe_loss={self.enable_probe_loss}"
         )
+        print(
+            "[VIAI-AV] EC modules: "
+            f"enable_ec_viai_av={self.enable_ec_viai_av} "
+            f"use_deterministic_adapter={self.use_deterministic_adapter} "
+            f"use_stochastic_adapter={self.use_stochastic_adapter} "
+            f"use_bottleneck_adapter={self.use_bottleneck_adapter} "
+            f"use_evidence_gate={self.use_evidence_gate} "
+            f"freeze_gate_evidence_backbone={self.freeze_gate_evidence_backbone} "
+            f"enable_visual_evidence_aug={self.enable_visual_evidence_aug} "
+            f"num_candidates={self.train_num_candidates} "
+            f"test_num_candidates={self.test_num_candidates}"
+        )
         if self.use_gan:
             print(
                 "[VIAI-AV] generator formula: "
@@ -121,7 +280,8 @@ class VIAIAVModel(object):
             print(
                 "[VIAI-AV] total formula: "
                 "loss_total = loss_av_gen + lambda_sync * loss_sync "
-                "+ lambda_probe * eta2 * loss_probe_gen"
+                "+ lambda_probe * eta2 * loss_probe_gen + loss_multi_candidate "
+                "+ weighted_loss_gate_evidence"
             )
 
     def _eta(self, step, base, interval, floor):
@@ -171,6 +331,113 @@ class VIAIAVModel(object):
         self.mel_target_4d = self.mel_target.unsqueeze(1)
         self.mel_input_4d = self.mel_input.unsqueeze(1)
         self.missing_mask = self.missing_mask.to(self.device)
+        self.visual_evidence_aug_mode = "none"
+
+    def _set_visual_evidence_aug_mode(self, mode):
+        self.visual_evidence_aug_mode = mode
+        self.visual_evidence_aug_mode_items = {
+            "none": 0.0,
+            "flow_75": 0.0,
+            "flow_50": 0.0,
+            "flow_25": 0.0,
+            "flow_zero": 0.0,
+            "static_video_zero_flow": 0.0,
+        }
+        self.visual_evidence_aug_mode_items[mode] = 1.0
+        self.visual_evidence_aug_applied_item = 0.0 if mode == "none" else 1.0
+
+    def _maybe_apply_visual_evidence_aug(self):
+        self._set_visual_evidence_aug_mode("none")
+        if not self.enable_visual_evidence_aug:
+            return
+        prob = float(getattr(self.hparams, "visual_evidence_aug_prob", 0.5))
+        if random.random() >= prob:
+            return
+        mode = random.choice(self.visual_evidence_aug_modes)
+        self.video_batch, self.flow_batch = EC_VIAI_Modules.apply_visual_evidence_augmentation(
+            self.video_batch,
+            self.flow_batch,
+            mode,
+        )
+        self._set_visual_evidence_aug_mode(mode)
+
+    def _gate_target_from_evidence(self, evidence):
+        low = float(getattr(self.hparams, "evidence_gate_low", 0.24))
+        high = float(getattr(self.hparams, "evidence_gate_high", 0.34))
+        target = (evidence - low) / (high - low)
+        return torch.clamp(target, min=0.0, max=1.0)
+
+    def _expand_features_for_candidates(self, features, num_candidates):
+        expanded_features = []
+        for feature in features:
+            batch_size, channels, height, width = feature.shape
+            expanded = feature.unsqueeze(1).expand(
+                batch_size,
+                num_candidates,
+                channels,
+                height,
+                width,
+            )
+            expanded_features.append(
+                expanded.reshape(batch_size * num_candidates, channels, height, width)
+            )
+        return expanded_features
+
+    def _expand_feature_for_candidates(self, feature, num_candidates):
+        batch_size, channels, height, width = feature.shape
+        expanded = feature.unsqueeze(1).expand(
+            batch_size,
+            num_candidates,
+            channels,
+            height,
+            width,
+        )
+        return expanded.reshape(batch_size * num_candidates, channels, height, width)
+
+    def _compose_candidate_mels(self, mel_candidates):
+        mask = self.missing_mask.unsqueeze(1).to(
+            device=mel_candidates.device,
+            dtype=mel_candidates.dtype,
+        )
+        mel_input = self.mel_input_4d.unsqueeze(1).to(
+            device=mel_candidates.device,
+            dtype=mel_candidates.dtype,
+        )
+        return mel_input * (1.0 - mask) + mel_candidates * mask
+
+    def _candidate_pairwise_distance_per_sample(self, mel_candidates):
+        batch_size = mel_candidates.size(0)
+        num_candidates = mel_candidates.size(1)
+        if num_candidates < 2:
+            return torch.zeros(batch_size, device=mel_candidates.device, dtype=mel_candidates.dtype)
+        mask = self.missing_mask.unsqueeze(1).unsqueeze(1).to(
+            device=mel_candidates.device,
+            dtype=mel_candidates.dtype,
+        )
+        pairwise_l1 = torch.abs(
+            mel_candidates.unsqueeze(2) - mel_candidates.unsqueeze(1)
+        )
+        pairwise_l1 = (pairwise_l1 * mask).sum(dim=(3, 4, 5)) / torch.clamp(
+            mask.sum(dim=(3, 4, 5)),
+            min=1.0,
+        )
+        pair_mask = torch.triu(
+            torch.ones(
+                num_candidates,
+                num_candidates,
+                device=mel_candidates.device,
+                dtype=torch.bool,
+            ),
+            diagonal=1,
+        )
+        return pairwise_l1[:, pair_mask].mean(dim=1)
+
+    def _update_candidate_pairwise_metrics(self):
+        self.candidate_pairwise_distance_per_sample = (
+            self._candidate_pairwise_distance_per_sample(self.mel_candidates)
+        )
+        self.candidate_pairwise_distance = self.candidate_pairwise_distance_per_sample.mean()
+        self.candidate_pairwise_l1 = self.candidate_pairwise_distance
 
     def _forward_inpainter(self):
         self.mel_features = self.Mel_Encoder(self.mel_input)
@@ -180,11 +447,119 @@ class VIAIAVModel(object):
         self.video_feature_flat = self.video_feature.flatten(1)
         self.mel_net_norm = util.l2_norm(self.mel_target_feature_flat.detach())
         self.video_net_norm = util.l2_norm(self.video_feature_flat)
-        self.mel_pred = self.Mel_Decoder(
-            self.mel_features,
-            self.mel_input_4d.size(),
-            self.video_feature,
+        with torch.no_grad():
+            self.evidence_score = self.EvidenceEstimator(
+                self.video_feature,
+                self.flow_batch,
+                self.mel_target_feature_flat,
+                self.video_feature_flat,
+            )
+        self.gate_target = self._gate_target_from_evidence(self.evidence_score).view(
+            self.video_feature.size(0),
+            1,
+            1,
+            1,
         )
+        decoder_video_feature = self.video_feature
+        self.calibrated_video_feature = self.video_feature
+        self.audio_prior_feature = torch.zeros_like(self.video_feature)
+        self.gate_value = torch.ones(
+            self.video_feature.size(0),
+            1,
+            1,
+            1,
+            device=self.video_feature.device,
+            dtype=self.video_feature.dtype,
+        )
+        if self.use_evidence_gate:
+            (
+                self.calibrated_video_feature,
+                self.gate_value,
+                self.audio_prior_feature,
+            ) = self.EvidenceFusionGate(
+                self.mel_features[-1],
+                self.video_feature,
+                self.evidence_score,
+            )
+            decoder_video_feature = self.calibrated_video_feature
+        decoder_features = self.mel_features
+        if self.use_stochastic_adapter:
+            num_candidates = int(self.current_num_candidates)
+            (
+                adapter_residuals,
+                _adapter_mu,
+                self.adapter_logvar,
+                self.adapter_sigma,
+            ) = self.BottleneckAdapter.sample_residuals(
+                self.mel_features[-1],
+                decoder_video_feature,
+                num_candidates=num_candidates,
+                sigma_min=getattr(self.hparams, "sigma_min", 0.0),
+                sigma_max=getattr(self.hparams, "sigma_max", 1.0),
+            )
+            batch_size = self.mel_features[-1].size(0)
+            self.adapter_residual = adapter_residuals[:, 0]
+            decoder_features = self._expand_features_for_candidates(
+                self.mel_features,
+                num_candidates,
+            )
+            decoder_features[-1] = decoder_features[-1] + adapter_residuals.reshape(
+                batch_size * num_candidates,
+                adapter_residuals.size(2),
+                adapter_residuals.size(3),
+                adapter_residuals.size(4),
+            )
+            decoder_video_feature_flat = self._expand_feature_for_candidates(
+                decoder_video_feature,
+                num_candidates,
+            )
+            mel_candidates_flat = self.Mel_Decoder(
+                decoder_features,
+                self.mel_input_4d.size(),
+                decoder_video_feature_flat,
+            )
+            self.mel_candidates = mel_candidates_flat.reshape(
+                batch_size,
+                num_candidates,
+                mel_candidates_flat.size(1),
+                mel_candidates_flat.size(2),
+                mel_candidates_flat.size(3),
+            )
+            self.mel_completed_candidates = self._compose_candidate_mels(self.mel_candidates)
+            self.mel_pred = self.mel_candidates[:, 0]
+            self.mel_completed_pred = self.mel_completed_candidates[:, 0]
+            self._update_candidate_pairwise_metrics()
+        elif self.use_deterministic_adapter:
+            self.adapter_residual = self.BottleneckAdapter(
+                self.mel_features[-1],
+                decoder_video_feature,
+            )
+            decoder_features = list(self.mel_features)
+            decoder_features[-1] = decoder_features[-1] + self.adapter_residual
+            self.adapter_logvar = torch.zeros_like(self.mel_features[-1])
+            self.adapter_sigma = torch.zeros_like(self.mel_features[-1])
+            self.mel_pred = self.Mel_Decoder(
+                decoder_features,
+                self.mel_input_4d.size(),
+                decoder_video_feature,
+            )
+            self.mel_candidates = self.mel_pred.unsqueeze(1)
+            self.mel_completed_candidates = self._compose_candidate_mels(self.mel_candidates)
+            self.mel_completed_pred = self.mel_completed_candidates[:, 0]
+            self._update_candidate_pairwise_metrics()
+        else:
+            self.adapter_residual = torch.zeros_like(self.mel_features[-1])
+            self.adapter_logvar = torch.zeros_like(self.mel_features[-1])
+            self.adapter_sigma = torch.zeros_like(self.mel_features[-1])
+            self.mel_pred = self.Mel_Decoder(
+                decoder_features,
+                self.mel_input_4d.size(),
+                decoder_video_feature,
+            )
+            self.mel_candidates = self.mel_pred.unsqueeze(1)
+            self.mel_completed_candidates = self._compose_candidate_mels(self.mel_candidates)
+            self.mel_completed_pred = self.mel_completed_candidates[:, 0]
+            self._update_candidate_pairwise_metrics()
         if self.enable_probe_loss:
             self.mel_probe_pred = self.Mel_Decoder(
                 self.mel_features,
@@ -204,6 +579,109 @@ class VIAIAVModel(object):
         loss_missing_l1 = masked_abs.sum() / torch.clamp(self.missing_mask.sum(), min=1.0)
         loss_recon = self.eta1 * loss_full_l1 + loss_missing_l1
         return loss_recon, loss_full_l1, loss_missing_l1
+
+    def _boundary_loss(self, mel_completed_candidates):
+        start, end = self.missing_span
+        start = int(start)
+        end = int(end)
+        time_steps = int(self.mel_target_4d.size(-1))
+        boundary_losses = []
+
+        if 0 < start < time_steps:
+            pred_delta = (
+                mel_completed_candidates[..., start]
+                - mel_completed_candidates[..., start - 1]
+            )
+            target_delta = (
+                self.mel_target_4d[..., start]
+                - self.mel_target_4d[..., start - 1]
+            ).unsqueeze(1)
+            boundary_losses.append(torch.abs(pred_delta - target_delta).mean())
+
+        if 0 < end < time_steps:
+            pred_delta = (
+                mel_completed_candidates[..., end]
+                - mel_completed_candidates[..., end - 1]
+            )
+            target_delta = (
+                self.mel_target_4d[..., end]
+                - self.mel_target_4d[..., end - 1]
+            ).unsqueeze(1)
+            boundary_losses.append(torch.abs(pred_delta - target_delta).mean())
+
+        if not boundary_losses:
+            return self._zero_loss_like(mel_completed_candidates)
+        return sum(boundary_losses) / len(boundary_losses)
+
+    def _multi_candidate_losses(self):
+        mel_candidates = self.mel_candidates
+        target = self.mel_target_4d.unsqueeze(1).to(
+            device=mel_candidates.device,
+            dtype=mel_candidates.dtype,
+        )
+        mask = self.missing_mask.unsqueeze(1).to(
+            device=mel_candidates.device,
+            dtype=mel_candidates.dtype,
+        )
+        self._update_candidate_pairwise_metrics()
+
+        self.loss_anchor, _, _ = self._reconstruction_losses(mel_candidates[:, 0])
+        candidate_abs = torch.abs(mel_candidates - target) * mask
+        candidate_missing_den = torch.clamp(mask.sum(dim=(2, 3, 4)), min=1.0)
+        candidate_missing_l1 = candidate_abs.sum(dim=(2, 3, 4)) / candidate_missing_den
+
+        self.loss_min_k = candidate_missing_l1.min(dim=1).values.mean()
+        self.loss_mean_k = candidate_missing_l1.mean()
+        self.loss_boundary = self._boundary_loss(self.mel_completed_candidates)
+        self.best_of_k_missing_l1 = self.loss_min_k
+        self.mean_k_missing_l1 = self.loss_mean_k
+
+        lambda_min_k = getattr(self.hparams, "lambda_min_k", 0.0)
+        lambda_mean_k = getattr(self.hparams, "lambda_mean_k", 0.0)
+        lambda_boundary = getattr(self.hparams, "lambda_boundary", 0.0)
+        lambda_diversity = getattr(self.hparams, "lambda_diversity", 0.0)
+        d_min = getattr(self.hparams, "evidence_diversity_d_min", 0.02)
+        alpha = getattr(self.hparams, "evidence_diversity_alpha", 0.08)
+        if lambda_diversity > 0.0 and mel_candidates.size(1) < 2:
+            raise ValueError("--lambda_diversity > 0 requires at least 2 candidates.")
+
+        evidence = self.evidence_score.to(
+            device=mel_candidates.device,
+            dtype=mel_candidates.dtype,
+        ).reshape(mel_candidates.size(0), -1)
+        if evidence.size(1) != 1:
+            evidence = evidence.mean(dim=1, keepdim=True)
+        self.evidence_diversity_target = d_min + alpha * (1.0 - evidence.detach())
+        diversity_gap_per_sample = (
+            self.candidate_pairwise_distance_per_sample
+            - self.evidence_diversity_target.squeeze(1)
+        )
+        self.evidence_diversity_gap = diversity_gap_per_sample.mean()
+        self.loss_evidence_div = torch.abs(diversity_gap_per_sample).mean()
+        self.weighted_loss_min_k = lambda_min_k * self.loss_min_k
+        self.weighted_loss_mean_k = lambda_mean_k * self.loss_mean_k
+        self.weighted_loss_boundary = lambda_boundary * self.loss_boundary
+        self.weighted_loss_evidence_div = lambda_diversity * self.loss_evidence_div
+        self.loss_multi_candidate = (
+            self.weighted_loss_min_k
+            + self.weighted_loss_mean_k
+            + self.weighted_loss_boundary
+            + self.weighted_loss_evidence_div
+        )
+        return self.loss_multi_candidate
+
+    def _gate_evidence_loss(self):
+        if not self.use_evidence_gate:
+            self.loss_gate_evidence = self._zero_loss_like(self.loss_av_gen)
+            self.weighted_loss_gate_evidence = self._zero_loss_like(self.loss_av_gen)
+            return self.weighted_loss_gate_evidence
+        self.loss_gate_evidence = self.criterion_gate_evidence(
+            self.gate_value,
+            self.gate_target.detach(),
+        )
+        lambda_gate_evidence = getattr(self.hparams, "lambda_gate_evidence", 0.0)
+        self.weighted_loss_gate_evidence = lambda_gate_evidence * self.loss_gate_evidence
+        return self.weighted_loss_gate_evidence
 
     def _compute_losses(self, global_step):
         self.eta1 = self._eta(
@@ -270,10 +748,17 @@ class VIAIAVModel(object):
         lambda_sync = getattr(self.hparams, "lambda_sync", 1.0)
         lambda_probe = getattr(self.hparams, "lambda_probe", 1.0)
         self.weighted_loss_probe_gen = self.eta2 * self.loss_probe_gen
-        self.loss_total = (
+        self._multi_candidate_losses()
+        self._gate_evidence_loss()
+        baseline_loss_total = (
             self.loss_av_gen
             + lambda_sync * self.loss_sync
             + lambda_probe * self.weighted_loss_probe_gen
+        )
+        self.loss_total = (
+            baseline_loss_total
+            + self.loss_multi_candidate
+            + self.weighted_loss_gate_evidence
         )
         if not self.use_gan:
             self.loss_D_real = self._zero_loss_like(self.loss_av_gen)
@@ -297,14 +782,14 @@ class VIAIAVModel(object):
         self.loss_D = 0.5 * (self.loss_D_real + self.loss_D_fake)
 
     def optimize_parameters(self, global_step):
-        self.Mel_Encoder.train()
-        self.VideoEncoder.train()
-        self.Mel_Decoder.train()
+        self.current_num_candidates = self.train_num_candidates
+        self._set_generator_train_modes()
         if self.use_gan:
             self.netD.eval()
             for parameter in self.netD.parameters():
                 parameter.requires_grad = False
 
+        self._maybe_apply_visual_evidence_aug()
         self._forward_inpainter()
         self._compute_losses(global_step)
         self.optimizer_G.zero_grad()
@@ -322,9 +807,14 @@ class VIAIAVModel(object):
         self.current_lr = self.optimizer_G.param_groups[0]["lr"]
 
     def test(self, global_step=0):
+        self.current_num_candidates = self.test_num_candidates
         self.Mel_Encoder.eval()
         self.VideoEncoder.eval()
         self.Mel_Decoder.eval()
+        if self.use_bottleneck_adapter:
+            self.BottleneckAdapter.eval()
+        if self.use_evidence_gate:
+            self.EvidenceFusionGate.eval()
         if self.use_gan:
             self.netD.eval()
         with torch.no_grad():
@@ -350,11 +840,81 @@ class VIAIAVModel(object):
         self.weighted_loss_probe_gen_item = float(
             self.weighted_loss_probe_gen.detach().cpu().item()
         )
+        self.loss_anchor_item = float(self.loss_anchor.detach().cpu().item())
+        self.loss_min_k_item = float(self.loss_min_k.detach().cpu().item())
+        self.loss_mean_k_item = float(self.loss_mean_k.detach().cpu().item())
+        self.loss_boundary_item = float(self.loss_boundary.detach().cpu().item())
+        self.loss_evidence_div_item = float(
+            self.loss_evidence_div.detach().cpu().item()
+        )
+        self.loss_gate_evidence_item = float(
+            self.loss_gate_evidence.detach().cpu().item()
+        )
+        self.loss_multi_candidate_item = float(
+            self.loss_multi_candidate.detach().cpu().item()
+        )
+        self.weighted_loss_min_k_item = float(
+            self.weighted_loss_min_k.detach().cpu().item()
+        )
+        self.weighted_loss_mean_k_item = float(
+            self.weighted_loss_mean_k.detach().cpu().item()
+        )
+        self.weighted_loss_boundary_item = float(
+            self.weighted_loss_boundary.detach().cpu().item()
+        )
+        self.weighted_loss_evidence_div_item = float(
+            self.weighted_loss_evidence_div.detach().cpu().item()
+        )
+        self.weighted_loss_gate_evidence_item = float(
+            self.weighted_loss_gate_evidence.detach().cpu().item()
+        )
+        self.best_of_k_missing_l1_item = float(
+            self.best_of_k_missing_l1.detach().cpu().item()
+        )
+        self.mean_k_missing_l1_item = float(
+            self.mean_k_missing_l1.detach().cpu().item()
+        )
         self.loss_D_item = float(self.loss_D.detach().cpu().item())
         self.loss_D_real_item = float(self.loss_D_real.detach().cpu().item())
         self.loss_D_fake_item = float(self.loss_D_fake.detach().cpu().item())
         self.eta1_item = float(self.eta1)
         self.eta2_item = float(self.eta2)
+        self.evidence_mean_item = float(self.evidence_score.detach().mean().cpu().item())
+        self.evidence_min_item = float(self.evidence_score.detach().min().cpu().item())
+        self.evidence_max_item = float(self.evidence_score.detach().max().cpu().item())
+        self.gate_mean_item = float(self.gate_value.detach().mean().cpu().item())
+        self.gate_min_item = float(self.gate_value.detach().min().cpu().item())
+        self.gate_max_item = float(self.gate_value.detach().max().cpu().item())
+        self.gate_target_mean_item = float(
+            self.gate_target.detach().mean().cpu().item()
+        )
+        self.gate_target_gap_item = self.gate_mean_item - self.gate_target_mean_item
+        if self.BottleneckAdapter is None:
+            self.adapter_scale_item = 0.0
+            self.adapter_stochastic_scale_item = 0.0
+        else:
+            self.adapter_scale_item = float(
+                self.BottleneckAdapter.residual_scale.detach().cpu().item()
+            )
+            self.adapter_stochastic_scale_item = float(
+                self.BottleneckAdapter.stochastic_residual_scale.detach().cpu().item()
+            )
+        self.adapter_residual_l1_item = float(
+            self.adapter_residual.detach().abs().mean().cpu().item()
+        )
+        self.adapter_logvar_mean_item = float(
+            self.adapter_logvar.detach().mean().cpu().item()
+        )
+        self.adapter_sigma_mean_item = float(self.adapter_sigma.detach().mean().cpu().item())
+        self.candidate_pairwise_distance_item = float(
+            self.candidate_pairwise_distance.detach().cpu().item()
+        )
+        self.evidence_diversity_gap_item = float(
+            self.evidence_diversity_gap.detach().cpu().item()
+        )
+        self.candidate_pairwise_l1_item = float(
+            self.candidate_pairwise_l1.detach().cpu().item()
+        )
 
     def TF_writer(self, writer, step, prefix="train"):
         if writer is None:
@@ -379,11 +939,109 @@ class VIAIAVModel(object):
                 self.weighted_loss_probe_gen_item,
                 step,
             )
+        writer.add_scalar(f"{prefix}/loss_anchor", self.loss_anchor_item, step)
+        writer.add_scalar(f"{prefix}/loss_min_k", self.loss_min_k_item, step)
+        writer.add_scalar(f"{prefix}/loss_mean_k", self.loss_mean_k_item, step)
+        writer.add_scalar(f"{prefix}/loss_boundary", self.loss_boundary_item, step)
+        writer.add_scalar(f"{prefix}/loss_evidence_div", self.loss_evidence_div_item, step)
+        writer.add_scalar(f"{prefix}/loss_gate_evidence", self.loss_gate_evidence_item, step)
+        writer.add_scalar(
+            f"{prefix}/loss_multi_candidate",
+            self.loss_multi_candidate_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/weighted_loss_min_k",
+            self.weighted_loss_min_k_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/weighted_loss_mean_k",
+            self.weighted_loss_mean_k_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/weighted_loss_boundary",
+            self.weighted_loss_boundary_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/weighted_loss_evidence_div",
+            self.weighted_loss_evidence_div_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/weighted_loss_gate_evidence",
+            self.weighted_loss_gate_evidence_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/candidate/best_of_k_missing_l1",
+            self.best_of_k_missing_l1_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/candidate/mean_k_missing_l1",
+            self.mean_k_missing_l1_item,
+            step,
+        )
         writer.add_scalar(f"{prefix}/loss_d", self.loss_D_item, step)
         writer.add_scalar(f"{prefix}/loss_d_real", self.loss_D_real_item, step)
         writer.add_scalar(f"{prefix}/loss_d_fake", self.loss_D_fake_item, step)
         writer.add_scalar(f"{prefix}/eta1", self.eta1_item, step)
         writer.add_scalar(f"{prefix}/eta2", self.eta2_item, step)
+        writer.add_scalar(f"{prefix}/evidence/mean", self.evidence_mean_item, step)
+        writer.add_scalar(f"{prefix}/evidence/min", self.evidence_min_item, step)
+        writer.add_scalar(f"{prefix}/evidence/max", self.evidence_max_item, step)
+        writer.add_scalar(f"{prefix}/gate/mean", self.gate_mean_item, step)
+        writer.add_scalar(f"{prefix}/gate/min", self.gate_min_item, step)
+        writer.add_scalar(f"{prefix}/gate/max", self.gate_max_item, step)
+        writer.add_scalar(f"{prefix}/gate/target_mean", self.gate_target_mean_item, step)
+        writer.add_scalar(f"{prefix}/gate/target_gap", self.gate_target_gap_item, step)
+        writer.add_scalar(
+            f"{prefix}/visual_evidence_aug/applied",
+            self.visual_evidence_aug_applied_item,
+            step,
+        )
+        for mode, value in sorted(self.visual_evidence_aug_mode_items.items()):
+            writer.add_scalar(f"{prefix}/visual_evidence_aug/{mode}", value, step)
+        writer.add_scalar(
+            f"{prefix}/candidate/pairwise_distance",
+            self.candidate_pairwise_distance_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/evidence_diversity_gap",
+            self.evidence_diversity_gap_item,
+            step,
+        )
+        if self.use_bottleneck_adapter:
+            writer.add_scalar(f"{prefix}/adapter/scale", self.adapter_scale_item, step)
+            writer.add_scalar(
+                f"{prefix}/adapter/stochastic_scale",
+                self.adapter_stochastic_scale_item,
+                step,
+            )
+            writer.add_scalar(
+                f"{prefix}/adapter/residual_l1",
+                self.adapter_residual_l1_item,
+                step,
+            )
+            writer.add_scalar(
+                f"{prefix}/adapter/logvar_mean",
+                self.adapter_logvar_mean_item,
+                step,
+            )
+            writer.add_scalar(
+                f"{prefix}/adapter/sigma_mean",
+                self.adapter_sigma_mean_item,
+                step,
+            )
+            writer.add_scalar(
+                f"{prefix}/candidate/pairwise_l1",
+                self.candidate_pairwise_l1_item,
+                step,
+            )
 
     def save_checkpoint(self, global_step, global_epoch, checkpoint_dir):
         os.makedirs(checkpoint_dir, exist_ok=True)
@@ -395,16 +1053,54 @@ class VIAIAVModel(object):
             "Mel_Encoder": self.Mel_Encoder.state_dict(),
             "VideoEncoder": self.VideoEncoder.state_dict(),
             "Mel_Decoder": self.Mel_Decoder.state_dict(),
+            "EvidenceEstimator": self.EvidenceEstimator.state_dict(),
             "optimizer_G": self.optimizer_G.state_dict()
             if self.hparams.save_optimizer_state
             else None,
             "global_step": global_step,
             "global_epoch": global_epoch,
             "use_gan": self.use_gan,
-            "stage": "VIAI-AV-stage4-sync-probe",
+            "stage": self._stage_name(),
             "enable_sync_loss": self.enable_sync_loss,
             "enable_probe_loss": self.enable_probe_loss,
+            "enable_ec_viai_av": self.enable_ec_viai_av,
+            "deterministic_adapter": bool(getattr(self.hparams, "deterministic_adapter", False)),
+            "stochastic_adapter": bool(getattr(self.hparams, "stochastic_adapter", False)),
+            "enable_evidence_gate": bool(getattr(self.hparams, "enable_evidence_gate", False)),
+            "freeze_gate_evidence_backbone": bool(
+                getattr(self.hparams, "freeze_gate_evidence_backbone", False)
+            ),
+            "num_candidates": int(getattr(self.hparams, "num_candidates", 1)),
+            "test_num_candidates": int(
+                getattr(self.hparams, "test_num_candidates", self.train_num_candidates)
+            ),
+            "evidence_diversity_d_min": float(
+                getattr(self.hparams, "evidence_diversity_d_min", 0.02)
+            ),
+            "evidence_diversity_alpha": float(
+                getattr(self.hparams, "evidence_diversity_alpha", 0.08)
+            ),
+            "lambda_gate_evidence": float(
+                getattr(self.hparams, "lambda_gate_evidence", 0.0)
+            ),
+            "evidence_gate_low": float(getattr(self.hparams, "evidence_gate_low", 0.24)),
+            "evidence_gate_high": float(getattr(self.hparams, "evidence_gate_high", 0.34)),
+            "enable_visual_evidence_aug": bool(
+                getattr(self.hparams, "enable_visual_evidence_aug", False)
+            ),
+            "visual_evidence_aug_prob": float(
+                getattr(self.hparams, "visual_evidence_aug_prob", 0.5)
+            ),
+            "visual_evidence_aug_modes": getattr(
+                self.hparams,
+                "visual_evidence_aug_modes",
+                "flow_75,flow_50,flow_25,flow_zero,static_video_zero_flow",
+            ),
         }
+        if self.use_bottleneck_adapter:
+            checkpoint["BottleneckAdapter"] = self.BottleneckAdapter.state_dict()
+        if self.use_evidence_gate:
+            checkpoint["EvidenceFusionGate"] = self.EvidenceFusionGate.state_dict()
         if self.use_gan:
             checkpoint["netD"] = self.netD.state_dict()
             checkpoint["optimizer_D"] = (
@@ -415,6 +1111,22 @@ class VIAIAVModel(object):
         torch.save(checkpoint, checkpoint_path)
         print("Saved VIAI-AV checkpoint:", checkpoint_path)
         return checkpoint_path
+
+    def _stage_name(self):
+        if self.use_evidence_gate and self.freeze_gate_evidence_backbone:
+            return "EC-VIAI-AV-stage7c-frozen-evidence-gate"
+        if self.use_evidence_gate and (
+            self.enable_visual_evidence_aug
+            or float(getattr(self.hparams, "lambda_gate_evidence", 0.0)) > 0.0
+        ):
+            return "EC-VIAI-AV-stage7b-controlled-evidence-gate"
+        if self.use_evidence_gate:
+            return "EC-VIAI-AV-stage7-evidence-gate"
+        if self.use_stochastic_adapter:
+            return "EC-VIAI-AV-stage5-stochastic-adapter"
+        if self.use_deterministic_adapter:
+            return "EC-VIAI-AV-stage4-deterministic-adapter"
+        return "VIAI-AV-stage4-sync-probe"
 
     def _checkpoint_use_gan(self, checkpoint):
         if "use_gan" in checkpoint:
@@ -434,6 +1146,36 @@ class VIAIAVModel(object):
             f"checkpoint use_gan={checkpoint_use_gan}, current use_gan={self.use_gan}. "
             f"{hint} checkpoint={checkpoint_path}"
         )
+
+    def _load_optional_module_state(self, module, checkpoint, key, label):
+        if key not in checkpoint:
+            print(f"[VIAI-AV] checkpoint has no {key}; {label} keeps current initialization")
+            return False
+        try:
+            missing, unexpected = module.load_state_dict(checkpoint[key], strict=False)
+        except RuntimeError as exc:
+            print(f"[VIAI-AV] skipped {label} state because it is incompatible: {exc}")
+            return False
+        if missing or unexpected:
+            print(
+                f"[VIAI-AV] loaded {label} with missing={list(missing)} "
+                f"unexpected={list(unexpected)}"
+            )
+        else:
+            print(f"[VIAI-AV] loaded {label}")
+        return True
+
+    def _load_optimizer_state(self, optimizer, state_dict, label):
+        if state_dict is None:
+            return False
+        try:
+            optimizer.load_state_dict(state_dict)
+        except (ValueError, RuntimeError) as exc:
+            print(f"[VIAI-AV] skipped {label} state because it is incompatible: {exc}")
+            return False
+        print(f"[VIAI-AV] loaded {label} state")
+        return True
+
     # 导入共有的结构权重，主要是Mel_Encoder和Mel_Decoder的权重，VideoEncoder不导入，因为VIAI-A没有视频编码器；如果有netD且当前模型使用GAN，则导入netD权重，否则不导入netD权重
     def load_checkpoint(self, checkpoint_path, reset_optimizer=False):
         checkpoint = torch.load(checkpoint_path, map_location=self.device)
@@ -448,11 +1190,58 @@ class VIAIAVModel(object):
                 "Use a stage3 checkpoint saved by train-viai-av."
             )
         self.VideoEncoder.load_state_dict(checkpoint["VideoEncoder"])
+        self._load_optional_module_state(
+            self.EvidenceEstimator,
+            checkpoint,
+            "EvidenceEstimator",
+            "EvidenceEstimator",
+        )
+        if self.BottleneckAdapter is None:
+            if "BottleneckAdapter" in checkpoint:
+                print(
+                    "[VIAI-AV] checkpoint has BottleneckAdapter, but current "
+                    "run does not enable it; skipped adapter weights"
+                )
+        else:
+            self._load_optional_module_state(
+                self.BottleneckAdapter,
+                checkpoint,
+                "BottleneckAdapter",
+                "BottleneckAdapter",
+            )
+        if self.EvidenceFusionGate is None:
+            if "EvidenceFusionGate" in checkpoint:
+                print(
+                    "[VIAI-AV] checkpoint has EvidenceFusionGate, but current "
+                    "run does not enable it; skipped gate weights"
+                )
+        else:
+            self._load_optional_module_state(
+                self.EvidenceFusionGate,
+                checkpoint,
+                "EvidenceFusionGate",
+                "EvidenceFusionGate",
+            )
+        checkpoint_stage = checkpoint.get("stage", "unknown")
+        self.loaded_stage = self._stage_name()
+        setattr(self.hparams, "loaded_stage", self.loaded_stage)
+        if checkpoint_stage != self.loaded_stage:
+            print(
+                f"[VIAI-AV] checkpoint stage={checkpoint_stage}; "
+                f"current model stage={self.loaded_stage}"
+            )
         if not reset_optimizer:
-            if checkpoint.get("optimizer_G") is not None:
-                self.optimizer_G.load_state_dict(checkpoint["optimizer_G"])
-            if self.use_gan and checkpoint.get("optimizer_D") is not None:
-                self.optimizer_D.load_state_dict(checkpoint["optimizer_D"])
+            self._load_optimizer_state(
+                self.optimizer_G,
+                checkpoint.get("optimizer_G"),
+                "optimizer_G",
+            )
+            if self.use_gan:
+                self._load_optimizer_state(
+                    self.optimizer_D,
+                    checkpoint.get("optimizer_D"),
+                    "optimizer_D",
+                )
         return int(checkpoint.get("global_step", 0)), int(checkpoint.get("global_epoch", 0))
 
     def load_viai_a_checkpoint(self, checkpoint_path):

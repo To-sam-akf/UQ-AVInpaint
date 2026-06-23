@@ -38,6 +38,21 @@ RESULT_FIELDS = [
     "use_gan",
     "enable_sync_loss",
     "enable_probe_loss",
+    "enable_ec_viai_av",
+    "num_candidates",
+    "test_num_candidates",
+    "stochastic_adapter",
+    "deterministic_adapter",
+    "enable_evidence_gate",
+    "freeze_gate_evidence_backbone",
+    "evidence_source",
+    "enable_visual_evidence_aug",
+    "visual_evidence_aug_prob",
+    "visual_evidence_aug_modes",
+    "sigma_min",
+    "sigma_max",
+    "save_candidates",
+    "video_perturbation",
     "num_samples",
     "loss_total",
     "loss_av_gen",
@@ -48,9 +63,38 @@ RESULT_FIELDS = [
     "loss_probe_recon",
     "loss_probe_g_gan",
     "loss_d",
+    "loss_anchor",
+    "loss_min_k",
+    "loss_mean_k",
+    "loss_boundary",
+    "loss_evidence_div",
+    "loss_gate_evidence",
+    "loss_multi_candidate",
+    "weighted_loss_min_k",
+    "weighted_loss_mean_k",
+    "weighted_loss_boundary",
+    "weighted_loss_evidence_div",
+    "weighted_loss_gate_evidence",
+    "best_of_k_missing_l1",
+    "mean_k_missing_l1",
+    "candidate_pairwise_distance",
+    "evidence_diversity_gap",
+    "gate_mean",
+    "gate_target_mean",
+    "gate_target_gap",
     "eta1",
     "eta2",
     "lambda_recon",
+    "lambda_min_k",
+    "lambda_mean_k",
+    "lambda_boundary",
+    "lambda_diversity",
+    "lambda_calib",
+    "lambda_gate_evidence",
+    "evidence_diversity_d_min",
+    "evidence_diversity_alpha",
+    "evidence_gate_low",
+    "evidence_gate_high",
     "mel_l1_full",
     "mel_l1_missing",
     "probe_l1_full",
@@ -84,13 +128,82 @@ def _arg_was_passed(name):
 
 def configure_viai_av_defaults():
     if not _arg_was_passed("--name"):
-        hparams.name = "VIAI-AV-PatchGAN" if getattr(hparams, "use_gan", False) else "VIAI-AV"
+        if getattr(hparams, "enable_ec_viai_av", False):
+            hparams.name = (
+                "EC-VIAI-AV-PatchGAN"
+                if getattr(hparams, "use_gan", False)
+                else "EC-VIAI-AV"
+            )
+        else:
+            hparams.name = (
+                "VIAI-AV-PatchGAN"
+                if getattr(hparams, "use_gan", False)
+                else "VIAI-AV"
+            )
     if not _arg_was_passed("--results_dir"):
-        hparams.results_dir = (
-            "./checkpoints/viai_av_patchgan_test_results"
-            if getattr(hparams, "use_gan", False)
-            else "./checkpoints/viai_av_test_results"
-        )
+        if getattr(hparams, "enable_ec_viai_av", False):
+            hparams.results_dir = (
+                "./checkpoints/ec_viai_av_patchgan_test_results"
+                if getattr(hparams, "use_gan", False)
+                else "./checkpoints/ec_viai_av_test_results"
+            )
+        else:
+            hparams.results_dir = (
+                "./checkpoints/viai_av_patchgan_test_results"
+                if getattr(hparams, "use_gan", False)
+                else "./checkpoints/viai_av_test_results"
+            )
+
+
+def print_viai_av_test_config():
+    print(
+        "[VIAI-AV test] run config: "
+        f"name={hparams.name} "
+        f"use_gan={getattr(hparams, 'use_gan', False)} "
+        f"lambda_recon={getattr(hparams, 'lambda_recon', 1.0)} "
+        f"lambda_gan={getattr(hparams, 'lambda_gan', 1.0)} "
+        f"lambda_sync={getattr(hparams, 'lambda_sync', 1.0)} "
+        f"lambda_probe={getattr(hparams, 'lambda_probe', 1.0)} "
+        f"disable_sync_loss={getattr(hparams, 'disable_sync_loss', False)} "
+        f"disable_probe_loss={getattr(hparams, 'disable_probe_loss', False)}"
+    )
+    print(
+        "[VIAI-AV test] EC config: "
+        f"enable_ec_viai_av={getattr(hparams, 'enable_ec_viai_av', False)} "
+        f"num_candidates={getattr(hparams, 'num_candidates', 1)} "
+        f"test_num_candidates={getattr(hparams, 'test_num_candidates', 1)} "
+        f"stochastic_adapter={getattr(hparams, 'stochastic_adapter', False)} "
+        f"deterministic_adapter={getattr(hparams, 'deterministic_adapter', False)} "
+        f"save_candidates={getattr(hparams, 'save_candidates', False)} "
+        f"video_perturbation={getattr(hparams, 'video_perturbation', 'none')}"
+    )
+    print(
+        "[VIAI-AV test] EC losses/evidence: "
+        f"lambda_min_k={getattr(hparams, 'lambda_min_k', 0.0)} "
+        f"lambda_mean_k={getattr(hparams, 'lambda_mean_k', 0.0)} "
+        f"lambda_boundary={getattr(hparams, 'lambda_boundary', 0.0)} "
+        f"lambda_diversity={getattr(hparams, 'lambda_diversity', 0.0)} "
+        f"lambda_calib={getattr(hparams, 'lambda_calib', 0.0)} "
+        f"lambda_gate_evidence={getattr(hparams, 'lambda_gate_evidence', 0.0)} "
+        f"enable_evidence_gate={getattr(hparams, 'enable_evidence_gate', False)} "
+        f"freeze_gate_evidence_backbone={getattr(hparams, 'freeze_gate_evidence_backbone', False)} "
+        f"evidence_source={getattr(hparams, 'evidence_source', 'none')} "
+        f"evidence_diversity_d_min={getattr(hparams, 'evidence_diversity_d_min', 0.02)} "
+        f"evidence_diversity_alpha={getattr(hparams, 'evidence_diversity_alpha', 0.08)} "
+        f"evidence_gate_low={getattr(hparams, 'evidence_gate_low', 0.24)} "
+        f"evidence_gate_high={getattr(hparams, 'evidence_gate_high', 0.34)} "
+        f"enable_visual_evidence_aug={getattr(hparams, 'enable_visual_evidence_aug', False)} "
+        f"visual_evidence_aug_prob={getattr(hparams, 'visual_evidence_aug_prob', 0.5)} "
+        f"visual_evidence_aug_modes={getattr(hparams, 'visual_evidence_aug_modes', '')} "
+        f"sigma_min={getattr(hparams, 'sigma_min', 0.0)} "
+        f"sigma_max={getattr(hparams, 'sigma_max', 1.0)}"
+    )
+    print(
+        "[VIAI-AV test] paths: "
+        f"checkpoint_dir={hparams.checkpoint_dir} "
+        f"resume_path={hparams.resume_path} "
+        f"results_dir={hparams.results_dir}"
+    )
 
 
 def checkpoint_step(path):
@@ -167,6 +280,25 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "loss_probe_recon": 0.0,
         "loss_probe_g_gan": 0.0,
         "loss_d": 0.0,
+        "loss_anchor": 0.0,
+        "loss_min_k": 0.0,
+        "loss_mean_k": 0.0,
+        "loss_boundary": 0.0,
+        "loss_evidence_div": 0.0,
+        "loss_gate_evidence": 0.0,
+        "loss_multi_candidate": 0.0,
+        "weighted_loss_min_k": 0.0,
+        "weighted_loss_mean_k": 0.0,
+        "weighted_loss_boundary": 0.0,
+        "weighted_loss_evidence_div": 0.0,
+        "weighted_loss_gate_evidence": 0.0,
+        "best_of_k_missing_l1": 0.0,
+        "mean_k_missing_l1": 0.0,
+        "candidate_pairwise_distance": 0.0,
+        "evidence_diversity_gap": 0.0,
+        "gate_mean": 0.0,
+        "gate_target_mean": 0.0,
+        "gate_target_gap": 0.0,
         "eta1": 0.0,
         "eta2": 0.0,
         "full_l1": 0.0,
@@ -212,6 +344,25 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         totals["loss_probe_recon"] += model.loss_probe_recon_item
         totals["loss_probe_g_gan"] += model.loss_probe_G_GAN_item
         totals["loss_d"] += model.loss_D_item
+        totals["loss_anchor"] += model.loss_anchor_item
+        totals["loss_min_k"] += model.loss_min_k_item
+        totals["loss_mean_k"] += model.loss_mean_k_item
+        totals["loss_boundary"] += model.loss_boundary_item
+        totals["loss_evidence_div"] += model.loss_evidence_div_item
+        totals["loss_gate_evidence"] += model.loss_gate_evidence_item
+        totals["loss_multi_candidate"] += model.loss_multi_candidate_item
+        totals["weighted_loss_min_k"] += model.weighted_loss_min_k_item
+        totals["weighted_loss_mean_k"] += model.weighted_loss_mean_k_item
+        totals["weighted_loss_boundary"] += model.weighted_loss_boundary_item
+        totals["weighted_loss_evidence_div"] += model.weighted_loss_evidence_div_item
+        totals["weighted_loss_gate_evidence"] += model.weighted_loss_gate_evidence_item
+        totals["best_of_k_missing_l1"] += model.best_of_k_missing_l1_item
+        totals["mean_k_missing_l1"] += model.mean_k_missing_l1_item
+        totals["candidate_pairwise_distance"] += model.candidate_pairwise_distance_item
+        totals["evidence_diversity_gap"] += model.evidence_diversity_gap_item
+        totals["gate_mean"] += model.gate_mean_item
+        totals["gate_target_mean"] += model.gate_target_mean_item
+        totals["gate_target_gap"] += model.gate_target_gap_item
         totals["eta1"] += model.eta1_item
         totals["eta2"] += model.eta2_item
         totals["full_l1"] += model.loss_full_l1_item
@@ -259,6 +410,11 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         progress.set_postfix(
             loss=f"{model.loss_total_item:.4f}",
             recon=f"{model.loss_recon_item:.4f}",
+            min_k=f"{model.loss_min_k_item:.4f}",
+            mean_k=f"{model.loss_mean_k_item:.4f}",
+            gate=f"{model.gate_mean_item:.3f}",
+            gate_t=f"{model.gate_target_mean_item:.3f}",
+            pair=f"{model.candidate_pairwise_distance_item:.4f}",
             sync=f"{model.loss_sync_item:.4f}",
             probe=f"{model.loss_probe_gen_item:.4f}",
             g_gan=f"{model.loss_G_GAN_item:.4f}",
@@ -283,6 +439,25 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "loss_probe_recon": totals["loss_probe_recon"] / batch_count,
         "loss_probe_g_gan": totals["loss_probe_g_gan"] / batch_count,
         "loss_d": totals["loss_d"] / batch_count,
+        "loss_anchor": totals["loss_anchor"] / batch_count,
+        "loss_min_k": totals["loss_min_k"] / batch_count,
+        "loss_mean_k": totals["loss_mean_k"] / batch_count,
+        "loss_boundary": totals["loss_boundary"] / batch_count,
+        "loss_evidence_div": totals["loss_evidence_div"] / batch_count,
+        "loss_gate_evidence": totals["loss_gate_evidence"] / batch_count,
+        "loss_multi_candidate": totals["loss_multi_candidate"] / batch_count,
+        "weighted_loss_min_k": totals["weighted_loss_min_k"] / batch_count,
+        "weighted_loss_mean_k": totals["weighted_loss_mean_k"] / batch_count,
+        "weighted_loss_boundary": totals["weighted_loss_boundary"] / batch_count,
+        "weighted_loss_evidence_div": totals["weighted_loss_evidence_div"] / batch_count,
+        "weighted_loss_gate_evidence": totals["weighted_loss_gate_evidence"] / batch_count,
+        "best_of_k_missing_l1": totals["best_of_k_missing_l1"] / batch_count,
+        "mean_k_missing_l1": totals["mean_k_missing_l1"] / batch_count,
+        "candidate_pairwise_distance": totals["candidate_pairwise_distance"] / batch_count,
+        "evidence_diversity_gap": totals["evidence_diversity_gap"] / batch_count,
+        "gate_mean": totals["gate_mean"] / batch_count,
+        "gate_target_mean": totals["gate_target_mean"] / batch_count,
+        "gate_target_gap": totals["gate_target_gap"] / batch_count,
         "eta1": totals["eta1"] / batch_count,
         "eta2": totals["eta2"] / batch_count,
         "mel_l1_full": totals["full_l1"] / batch_count,
@@ -310,10 +485,38 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "global_step": int(global_step),
         "global_epoch": int(global_epoch),
         "test_split_name": hparams.test_split_name,
-        "stage": "VIAI-AV-stage4-sync-probe",
+        "stage": getattr(
+            hparams,
+            "loaded_stage",
+            "EC-VIAI-AV-stage4-deterministic-adapter"
+            if bool(getattr(hparams, "enable_ec_viai_av", False))
+            and bool(getattr(hparams, "deterministic_adapter", False))
+            else "VIAI-AV-stage4-sync-probe",
+        ),
         "use_gan": bool(getattr(hparams, "use_gan", False)),
         "enable_sync_loss": not bool(getattr(hparams, "disable_sync_loss", False)),
         "enable_probe_loss": not bool(getattr(hparams, "disable_probe_loss", False)),
+        "enable_ec_viai_av": bool(getattr(hparams, "enable_ec_viai_av", False)),
+        "num_candidates": int(getattr(hparams, "num_candidates", 1)),
+        "test_num_candidates": int(getattr(hparams, "test_num_candidates", 1)),
+        "stochastic_adapter": bool(getattr(hparams, "stochastic_adapter", False)),
+        "deterministic_adapter": bool(getattr(hparams, "deterministic_adapter", False)),
+        "enable_evidence_gate": bool(getattr(hparams, "enable_evidence_gate", False)),
+        "freeze_gate_evidence_backbone": bool(
+            getattr(hparams, "freeze_gate_evidence_backbone", False)
+        ),
+        "evidence_source": getattr(hparams, "evidence_source", "none"),
+        "enable_visual_evidence_aug": bool(
+            getattr(hparams, "enable_visual_evidence_aug", False)
+        ),
+        "visual_evidence_aug_prob": float(
+            getattr(hparams, "visual_evidence_aug_prob", 0.5)
+        ),
+        "visual_evidence_aug_modes": getattr(hparams, "visual_evidence_aug_modes", ""),
+        "sigma_min": float(getattr(hparams, "sigma_min", 0.0)),
+        "sigma_max": float(getattr(hparams, "sigma_max", 1.0)),
+        "save_candidates": bool(getattr(hparams, "save_candidates", False)),
+        "video_perturbation": getattr(hparams, "video_perturbation", "none"),
         "num_samples": int(results["num_samples"]),
         "loss_total": float(results["loss_total"]),
         "loss_av_gen": float(results["loss_av_gen"]),
@@ -324,9 +527,42 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "loss_probe_recon": float(results["loss_probe_recon"]),
         "loss_probe_g_gan": float(results["loss_probe_g_gan"]),
         "loss_d": float(results["loss_d"]),
+        "loss_anchor": float(results["loss_anchor"]),
+        "loss_min_k": float(results["loss_min_k"]),
+        "loss_mean_k": float(results["loss_mean_k"]),
+        "loss_boundary": float(results["loss_boundary"]),
+        "loss_evidence_div": float(results["loss_evidence_div"]),
+        "loss_gate_evidence": float(results["loss_gate_evidence"]),
+        "loss_multi_candidate": float(results["loss_multi_candidate"]),
+        "weighted_loss_min_k": float(results["weighted_loss_min_k"]),
+        "weighted_loss_mean_k": float(results["weighted_loss_mean_k"]),
+        "weighted_loss_boundary": float(results["weighted_loss_boundary"]),
+        "weighted_loss_evidence_div": float(results["weighted_loss_evidence_div"]),
+        "weighted_loss_gate_evidence": float(results["weighted_loss_gate_evidence"]),
+        "best_of_k_missing_l1": float(results["best_of_k_missing_l1"]),
+        "mean_k_missing_l1": float(results["mean_k_missing_l1"]),
+        "candidate_pairwise_distance": float(results["candidate_pairwise_distance"]),
+        "evidence_diversity_gap": float(results["evidence_diversity_gap"]),
+        "gate_mean": float(results["gate_mean"]),
+        "gate_target_mean": float(results["gate_target_mean"]),
+        "gate_target_gap": float(results["gate_target_gap"]),
         "eta1": float(results["eta1"]),
         "eta2": float(results["eta2"]),
         "lambda_recon": float(getattr(hparams, "lambda_recon", 1.0)),
+        "lambda_min_k": float(getattr(hparams, "lambda_min_k", 0.0)),
+        "lambda_mean_k": float(getattr(hparams, "lambda_mean_k", 0.0)),
+        "lambda_boundary": float(getattr(hparams, "lambda_boundary", 0.0)),
+        "lambda_diversity": float(getattr(hparams, "lambda_diversity", 0.0)),
+        "lambda_calib": float(getattr(hparams, "lambda_calib", 0.0)),
+        "lambda_gate_evidence": float(getattr(hparams, "lambda_gate_evidence", 0.0)),
+        "evidence_diversity_d_min": float(
+            getattr(hparams, "evidence_diversity_d_min", 0.02)
+        ),
+        "evidence_diversity_alpha": float(
+            getattr(hparams, "evidence_diversity_alpha", 0.08)
+        ),
+        "evidence_gate_low": float(getattr(hparams, "evidence_gate_low", 0.24)),
+        "evidence_gate_high": float(getattr(hparams, "evidence_gate_high", 0.34)),
         "mel_l1_full": float(results["mel_l1_full"]),
         "mel_l1_missing": float(results["mel_l1_missing"]),
         "probe_l1_full": float(results["probe_l1_full"]),
@@ -360,6 +596,8 @@ def coerce_csv_record(row):
         "checkpoint_step",
         "global_step",
         "global_epoch",
+        "num_candidates",
+        "test_num_candidates",
         "num_samples",
         "vocoder_n_iter",
         "vocoder_num_samples",
@@ -374,9 +612,41 @@ def coerce_csv_record(row):
         "loss_probe_recon",
         "loss_probe_g_gan",
         "loss_d",
+        "loss_anchor",
+        "loss_min_k",
+        "loss_mean_k",
+        "loss_boundary",
+        "loss_evidence_div",
+        "loss_gate_evidence",
+        "loss_multi_candidate",
+        "weighted_loss_min_k",
+        "weighted_loss_mean_k",
+        "weighted_loss_boundary",
+        "weighted_loss_evidence_div",
+        "weighted_loss_gate_evidence",
+        "best_of_k_missing_l1",
+        "mean_k_missing_l1",
+        "candidate_pairwise_distance",
+        "evidence_diversity_gap",
+        "gate_mean",
+        "gate_target_mean",
+        "gate_target_gap",
         "eta1",
         "eta2",
         "lambda_recon",
+        "lambda_min_k",
+        "lambda_mean_k",
+        "lambda_boundary",
+        "lambda_diversity",
+        "lambda_calib",
+        "lambda_gate_evidence",
+        "evidence_diversity_d_min",
+        "evidence_diversity_alpha",
+        "evidence_gate_low",
+        "evidence_gate_high",
+        "visual_evidence_aug_prob",
+        "sigma_min",
+        "sigma_max",
         "mel_l1_full",
         "mel_l1_missing",
         "probe_l1_full",
@@ -438,6 +708,7 @@ def write_result_files(record, results_dir, name):
 
 def main():
     configure_viai_av_defaults()
+    print_viai_av_test_config()
     data_loaders = av_loader.get_data_loaders(
         hparams.data_root,
         hparams.speaker_id,
@@ -497,6 +768,18 @@ def main():
         f"g_gan={results['loss_g_gan']:.6f} "
         f"probe_g_gan={results['loss_probe_g_gan']:.6f} "
         f"d={results['loss_d']:.6f} "
+        f"min_k={results['loss_min_k']:.6f} "
+        f"mean_k={results['loss_mean_k']:.6f} "
+        f"boundary={results['loss_boundary']:.6f} "
+        f"evidence_div={results['loss_evidence_div']:.6f} "
+        f"gate_ev={results['loss_gate_evidence']:.6f} "
+        f"multi={results['loss_multi_candidate']:.6f} "
+        f"best_of_k={results['best_of_k_missing_l1']:.6f} "
+        f"pairwise={results['candidate_pairwise_distance']:.6f} "
+        f"div_gap={results['evidence_diversity_gap']:.6f} "
+        f"gate_mean={results['gate_mean']:.6f} "
+        f"gate_target={results['gate_target_mean']:.6f} "
+        f"gate_gap={results['gate_target_gap']:.6f} "
         f"eta1={results['eta1']:.6f} "
         f"eta2={results['eta2']:.6f} "
         f"mel_l1_full={results['mel_l1_full']:.6f} "

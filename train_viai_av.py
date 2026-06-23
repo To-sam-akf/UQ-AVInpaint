@@ -28,13 +28,31 @@ def _arg_was_passed(name):
 
 def configure_viai_av_defaults():
     if not _arg_was_passed("--name"):
-        hparams.name = "VIAI-AV-PatchGAN" if getattr(hparams, "use_gan", False) else "VIAI-AV"
+        if getattr(hparams, "enable_ec_viai_av", False):
+            hparams.name = (
+                "EC-VIAI-AV-PatchGAN"
+                if getattr(hparams, "use_gan", False)
+                else "EC-VIAI-AV"
+            )
+        else:
+            hparams.name = (
+                "VIAI-AV-PatchGAN"
+                if getattr(hparams, "use_gan", False)
+                else "VIAI-AV"
+            )
     if not _arg_was_passed("--log_event_path"):
-        event_name = (
-            "events_viai_av_patchgan"
-            if getattr(hparams, "use_gan", False)
-            else "events_viai_av"
-        )
+        if getattr(hparams, "enable_ec_viai_av", False):
+            event_name = (
+                "events_ec_viai_av_patchgan"
+                if getattr(hparams, "use_gan", False)
+                else "events_ec_viai_av"
+            )
+        else:
+            event_name = (
+                "events_viai_av_patchgan"
+                if getattr(hparams, "use_gan", False)
+                else "events_viai_av"
+            )
         hparams.log_event_path = os.path.join(hparams.checkpoint_dir, event_name)
 
 
@@ -50,7 +68,39 @@ def print_viai_av_run_config():
         f"disable_probe_loss={getattr(hparams, 'disable_probe_loss', False)}"
     )
     print(
+        "[VIAI-AV] EC config: "
+        f"enable_ec_viai_av={getattr(hparams, 'enable_ec_viai_av', False)} "
+        f"num_candidates={getattr(hparams, 'num_candidates', 1)} "
+        f"test_num_candidates={getattr(hparams, 'test_num_candidates', 1)} "
+        f"stochastic_adapter={getattr(hparams, 'stochastic_adapter', False)} "
+        f"deterministic_adapter={getattr(hparams, 'deterministic_adapter', False)} "
+        f"save_candidates={getattr(hparams, 'save_candidates', False)} "
+        f"video_perturbation={getattr(hparams, 'video_perturbation', 'none')}"
+    )
+    print(
+        "[VIAI-AV] EC losses/evidence: "
+        f"lambda_min_k={getattr(hparams, 'lambda_min_k', 0.0)} "
+        f"lambda_mean_k={getattr(hparams, 'lambda_mean_k', 0.0)} "
+        f"lambda_boundary={getattr(hparams, 'lambda_boundary', 0.0)} "
+        f"lambda_diversity={getattr(hparams, 'lambda_diversity', 0.0)} "
+        f"lambda_calib={getattr(hparams, 'lambda_calib', 0.0)} "
+        f"lambda_gate_evidence={getattr(hparams, 'lambda_gate_evidence', 0.0)} "
+        f"enable_evidence_gate={getattr(hparams, 'enable_evidence_gate', False)} "
+        f"freeze_gate_evidence_backbone={getattr(hparams, 'freeze_gate_evidence_backbone', False)} "
+        f"evidence_source={getattr(hparams, 'evidence_source', 'none')} "
+        f"evidence_diversity_d_min={getattr(hparams, 'evidence_diversity_d_min', 0.02)} "
+        f"evidence_diversity_alpha={getattr(hparams, 'evidence_diversity_alpha', 0.08)} "
+        f"evidence_gate_low={getattr(hparams, 'evidence_gate_low', 0.24)} "
+        f"evidence_gate_high={getattr(hparams, 'evidence_gate_high', 0.34)} "
+        f"enable_visual_evidence_aug={getattr(hparams, 'enable_visual_evidence_aug', False)} "
+        f"visual_evidence_aug_prob={getattr(hparams, 'visual_evidence_aug_prob', 0.5)} "
+        f"visual_evidence_aug_modes={getattr(hparams, 'visual_evidence_aug_modes', '')} "
+        f"sigma_min={getattr(hparams, 'sigma_min', 0.0)} "
+        f"sigma_max={getattr(hparams, 'sigma_max', 1.0)}"
+    )
+    print(
         "[VIAI-AV] paths: "
+        f"name={hparams.name} "
         f"checkpoint_dir={hparams.checkpoint_dir} "
         f"log_event_path={hparams.log_event_path} "
         f"init_from_viai_a={hparams.init_from_viai_a} "
@@ -181,6 +231,32 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         "loss_probe_full_l1": 0.0,
         "loss_probe_missing_l1": 0.0,
         "loss_probe_g_gan": 0.0,
+        "loss_anchor": 0.0,
+        "loss_min_k": 0.0,
+        "loss_mean_k": 0.0,
+        "loss_boundary": 0.0,
+        "loss_evidence_div": 0.0,
+        "loss_gate_evidence": 0.0,
+        "loss_multi_candidate": 0.0,
+        "weighted_loss_min_k": 0.0,
+        "weighted_loss_mean_k": 0.0,
+        "weighted_loss_boundary": 0.0,
+        "weighted_loss_evidence_div": 0.0,
+        "weighted_loss_gate_evidence": 0.0,
+        "best_of_k_missing_l1": 0.0,
+        "mean_k_missing_l1": 0.0,
+        "candidate_pairwise_distance": 0.0,
+        "evidence_diversity_gap": 0.0,
+        "gate_mean": 0.0,
+        "gate_target_mean": 0.0,
+        "gate_target_gap": 0.0,
+        "visual_evidence_aug_applied": 0.0,
+        "visual_evidence_aug_none": 0.0,
+        "visual_evidence_aug_flow_75": 0.0,
+        "visual_evidence_aug_flow_50": 0.0,
+        "visual_evidence_aug_flow_25": 0.0,
+        "visual_evidence_aug_flow_zero": 0.0,
+        "visual_evidence_aug_static_video_zero_flow": 0.0,
         "loss_d": 0.0,
         "psnr_full": 0.0,
         "psnr_missing": 0.0,
@@ -231,6 +307,28 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         totals["loss_probe_full_l1"] += model.loss_probe_full_l1_item
         totals["loss_probe_missing_l1"] += model.loss_probe_missing_l1_item
         totals["loss_probe_g_gan"] += model.loss_probe_G_GAN_item
+        totals["loss_anchor"] += model.loss_anchor_item
+        totals["loss_min_k"] += model.loss_min_k_item
+        totals["loss_mean_k"] += model.loss_mean_k_item
+        totals["loss_boundary"] += model.loss_boundary_item
+        totals["loss_evidence_div"] += model.loss_evidence_div_item
+        totals["loss_gate_evidence"] += model.loss_gate_evidence_item
+        totals["loss_multi_candidate"] += model.loss_multi_candidate_item
+        totals["weighted_loss_min_k"] += model.weighted_loss_min_k_item
+        totals["weighted_loss_mean_k"] += model.weighted_loss_mean_k_item
+        totals["weighted_loss_boundary"] += model.weighted_loss_boundary_item
+        totals["weighted_loss_evidence_div"] += model.weighted_loss_evidence_div_item
+        totals["weighted_loss_gate_evidence"] += model.weighted_loss_gate_evidence_item
+        totals["best_of_k_missing_l1"] += model.best_of_k_missing_l1_item
+        totals["mean_k_missing_l1"] += model.mean_k_missing_l1_item
+        totals["candidate_pairwise_distance"] += model.candidate_pairwise_distance_item
+        totals["evidence_diversity_gap"] += model.evidence_diversity_gap_item
+        totals["gate_mean"] += model.gate_mean_item
+        totals["gate_target_mean"] += model.gate_target_mean_item
+        totals["gate_target_gap"] += model.gate_target_gap_item
+        totals["visual_evidence_aug_applied"] += model.visual_evidence_aug_applied_item
+        for mode, value in model.visual_evidence_aug_mode_items.items():
+            totals[f"visual_evidence_aug_{mode}"] += value
         totals["loss_d"] += model.loss_D_item
         totals["psnr_full"] += metrics["psnr_full_sum"]
         totals["psnr_missing"] += metrics["psnr_missing_sum"]
@@ -243,6 +341,12 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
             step=global_step,
             loss=f"{model.loss_total_item:.4f}",
             recon=f"{model.loss_recon_item:.4f}",
+            min_k=f"{model.loss_min_k_item:.4f}",
+            mean_k=f"{model.loss_mean_k_item:.4f}",
+            gate=f"{model.gate_mean_item:.3f}",
+            gate_t=f"{model.gate_target_mean_item:.3f}",
+            aug=model.visual_evidence_aug_mode,
+            pair=f"{model.candidate_pairwise_distance_item:.4f}",
             sync=f"{model.loss_sync_item:.4f}",
             probe=f"{model.loss_probe_gen_item:.4f}",
             g_gan=f"{model.loss_G_GAN_item:.4f}",
@@ -274,6 +378,19 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
                 f"probe={model.loss_probe_gen_item:.6f} "
                 f"probe_full_l1={model.loss_probe_full_l1_item:.6f} "
                 f"probe_missing_l1={model.loss_probe_missing_l1_item:.6f} "
+                f"min_k={model.loss_min_k_item:.6f} "
+                f"mean_k={model.loss_mean_k_item:.6f} "
+                f"boundary={model.loss_boundary_item:.6f} "
+                f"evidence_div={model.loss_evidence_div_item:.6f} "
+                f"gate_ev={model.loss_gate_evidence_item:.6f} "
+                f"multi={model.loss_multi_candidate_item:.6f} "
+                f"best_of_k={model.best_of_k_missing_l1_item:.6f} "
+                f"pairwise={model.candidate_pairwise_distance_item:.6f} "
+                f"div_gap={model.evidence_diversity_gap_item:.6f} "
+                f"gate_mean={model.gate_mean_item:.6f} "
+                f"gate_target={model.gate_target_mean_item:.6f} "
+                f"gate_gap={model.gate_target_gap_item:.6f} "
+                f"aug={model.visual_evidence_aug_mode} "
                 f"g_gan={model.loss_G_GAN_item:.6f} "
                 f"weighted_gan={model.weighted_loss_gan_item:.6f} "
                 f"weighted_recon={model.weighted_loss_recon_item:.6f} "
@@ -325,6 +442,34 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         "loss_probe_full_l1": totals["loss_probe_full_l1"] / batch_count,
         "loss_probe_missing_l1": totals["loss_probe_missing_l1"] / batch_count,
         "loss_probe_g_gan": totals["loss_probe_g_gan"] / batch_count,
+        "loss_anchor": totals["loss_anchor"] / batch_count,
+        "loss_min_k": totals["loss_min_k"] / batch_count,
+        "loss_mean_k": totals["loss_mean_k"] / batch_count,
+        "loss_boundary": totals["loss_boundary"] / batch_count,
+        "loss_evidence_div": totals["loss_evidence_div"] / batch_count,
+        "loss_gate_evidence": totals["loss_gate_evidence"] / batch_count,
+        "loss_multi_candidate": totals["loss_multi_candidate"] / batch_count,
+        "weighted_loss_min_k": totals["weighted_loss_min_k"] / batch_count,
+        "weighted_loss_mean_k": totals["weighted_loss_mean_k"] / batch_count,
+        "weighted_loss_boundary": totals["weighted_loss_boundary"] / batch_count,
+        "weighted_loss_evidence_div": totals["weighted_loss_evidence_div"] / batch_count,
+        "weighted_loss_gate_evidence": totals["weighted_loss_gate_evidence"] / batch_count,
+        "best_of_k_missing_l1": totals["best_of_k_missing_l1"] / batch_count,
+        "mean_k_missing_l1": totals["mean_k_missing_l1"] / batch_count,
+        "candidate_pairwise_distance": totals["candidate_pairwise_distance"] / batch_count,
+        "evidence_diversity_gap": totals["evidence_diversity_gap"] / batch_count,
+        "gate_mean": totals["gate_mean"] / batch_count,
+        "gate_target_mean": totals["gate_target_mean"] / batch_count,
+        "gate_target_gap": totals["gate_target_gap"] / batch_count,
+        "visual_evidence_aug_applied": totals["visual_evidence_aug_applied"] / batch_count,
+        "visual_evidence_aug_none": totals["visual_evidence_aug_none"] / batch_count,
+        "visual_evidence_aug_flow_75": totals["visual_evidence_aug_flow_75"] / batch_count,
+        "visual_evidence_aug_flow_50": totals["visual_evidence_aug_flow_50"] / batch_count,
+        "visual_evidence_aug_flow_25": totals["visual_evidence_aug_flow_25"] / batch_count,
+        "visual_evidence_aug_flow_zero": totals["visual_evidence_aug_flow_zero"] / batch_count,
+        "visual_evidence_aug_static_video_zero_flow": (
+            totals["visual_evidence_aug_static_video_zero_flow"] / batch_count
+        ),
         "loss_d": totals["loss_d"] / batch_count,
         "psnr_full": totals["psnr_full"] / max(1, sample_count),
         "psnr_missing": totals["psnr_missing"] / max(1, sample_count),
@@ -348,6 +493,19 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         f"probe={averages['loss_probe_gen']:.6f} "
         f"probe_full_l1={averages['loss_probe_full_l1']:.6f} "
         f"probe_missing_l1={averages['loss_probe_missing_l1']:.6f} "
+        f"min_k={averages['loss_min_k']:.6f} "
+        f"mean_k={averages['loss_mean_k']:.6f} "
+        f"boundary={averages['loss_boundary']:.6f} "
+        f"evidence_div={averages['loss_evidence_div']:.6f} "
+        f"gate_ev={averages['loss_gate_evidence']:.6f} "
+        f"multi={averages['loss_multi_candidate']:.6f} "
+        f"best_of_k={averages['best_of_k_missing_l1']:.6f} "
+        f"pairwise={averages['candidate_pairwise_distance']:.6f} "
+        f"div_gap={averages['evidence_diversity_gap']:.6f} "
+        f"gate_mean={averages['gate_mean']:.6f} "
+        f"gate_target={averages['gate_target_mean']:.6f} "
+        f"gate_gap={averages['gate_target_gap']:.6f} "
+        f"aug_rate={averages['visual_evidence_aug_applied']:.3f} "
         f"g_gan={averages['loss_g_gan']:.6f} "
         f"probe_g_gan={averages['loss_probe_g_gan']:.6f} "
         f"d={averages['loss_d']:.6f} "
