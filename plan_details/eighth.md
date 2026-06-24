@@ -79,3 +79,217 @@
 - 第 8 步默认不改 Stage6/7c/7d 旧命令行为；必须显式传 `--enable_candidate_scorer` 才启用新 top-1 选择。
 - hard argmax 是默认输出策略；soft-weighted candidate 可作为内部诊断张量保留，但不写入 `self.mel_pred`。
 - `lambda_calib` 同时控制 scorer CE 和 uncertainty calibration，避免再引入一个重复 loss 权重。
+
+
+## 训练和验证
+去云端做 **Stage8 smoke + short validation**。建议别直接长训，先确认 scorer/calibration 链路真的稳定。
+
+先从 Stage7d checkpoint 继续训一个短实验：
+
+```bash
+export DATA_ROOT=/root/shared-nvme/data
+export STAGE7D_CKPT=/path/to/stage7d_checkpoint.pth.tar
+export EXP_DIR=checkpoints/stage8_candidate_scorer_smoke
+
+python main.py train-viai-av -- \
+  --use_gan \
+  --lambda_gan 0.001 \
+  --enable_ec_viai_av \
+  --stochastic_adapter \
+  --enable_evidence_gate \
+  --freeze_gate_evidence_backbone \
+  --enable_evidence_scaled_sigma \
+  --enable_candidate_scorer \
+  --evidence_sigma_scale_min 0.5 \
+  --evidence_sigma_scale_max 2.0 \
+  --sigma_max 2.0 \
+  --num_candidates 4 \
+  --test_num_candidates 4 \
+  --lambda_min_k 1.0 \
+  --lambda_mean_k 0.1 \
+  --lambda_boundary 0.05 \
+  --lambda_diversity 0.05 \
+  --lambda_gate_evidence 0.1 \
+  --lambda_calib 0.1 \
+  --calib_error_tau 0.1 \
+  --resume \
+  --resume_path "$STAGE7D_CKPT" \
+  --reset_optimizer \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --checkpoint_dir "$EXP_DIR" \
+  --log_event_path "$EXP_DIR/events" \
+  --batch_size 1 \
+  --num_workers 0 \
+  --max_train_steps 100 \
+  --checkpoint_interval 100 \
+  --print_freq 10 \
+  --display_id 0
+```
+
+重点看这些 TensorBoard/日志指标：
+
+```text
+loss_candidate_scorer
+loss_uncertainty_calib
+loss_calib
+weighted_loss_calib
+candidate/top1_missing_l1
+candidate/candidate0_missing_l1
+candidate/random_expected_missing_l1
+candidate/best_of_k_missing_l1
+candidate/oracle_gain
+candidate/pi_entropy
+candidate/pi_max
+uncertainty/mean
+```
+
+如果 100 steps 没 NaN、`pi` 没明显异常，再跑测试：
+
+```bash
+export STAGE8_CKPT=$EXP_DIR/EC-VIAI-AV-PatchGAN_checkpoint_stepXXXXXXXXX.pth.tar
+
+python main.py test-viai-av -- \
+  --use_gan \
+  --lambda_gan 0.001 \
+  --enable_ec_viai_av \
+  --stochastic_adapter \
+  --enable_evidence_gate \
+  --freeze_gate_evidence_backbone \
+  --enable_evidence_scaled_sigma \
+  --enable_candidate_scorer \
+  --evidence_sigma_scale_min 0.5 \
+  --evidence_sigma_scale_max 2.0 \
+  --sigma_max 2.0 \
+  --num_candidates 4 \
+  --test_num_candidates 4 \
+  --lambda_calib 0.1 \
+  --resume_path "$STAGE8_CKPT" \
+  --data_root "$DATA_ROOT" \
+  --test_split_name test_av_split.txt \
+  --batch_size 1 \
+  --num_workers 0 \
+  --results_dir checkpoints/stage8_candidate_scorer_test \
+  --display_id 0
+```
+
+成功标准先定得朴素一点：
+
+- `top1_missing_l1` 优于或接近 `candidate0_missing_l1`
+- `top1_missing_l1` 优于 `random_expected_missing_l1`
+- `oracle_gain = top1 - best_of_k` 为正但逐步变小
+- `uncertainty_error_corr` / Spearman 为正
+- normal 质量不要比 Stage7d 明显崩坏
+
+如果这些成立，再把 `--max_train_steps` 提到继续训练 1000 steps，然后做正式 Stage7d vs Stage8 对照。
+
+
+下面给你两组：**继续训练 Stage8** 和 **验证 Stage8 checkpoint**。你只需要把 `DATA_ROOT` 和 `STAGE8_CKPT` 改成你云端真实路径。
+
+**1. 继续训练 Stage8**
+
+建议先继续到 `1000` 或 `3000` steps。这里示例用 `3000`：
+
+```bash
+export DATA_ROOT=/root/shared-nvme/data
+export STAGE8_CKPT=/root/EC-ViAv-vgpu/checkpoints/stage8_candidate_scorer_smoke/EC-VIAI-AV-PatchGAN_checkpoint_step000027100.pth.tar
+export EXP_DIR=checkpoints/stage8_candidate_scorer_3k
+
+python main.py train-viai-av -- \
+  --use_gan \
+  --lambda_gan 0.001 \
+  --enable_ec_viai_av \
+  --stochastic_adapter \
+  --enable_evidence_gate \
+  --freeze_gate_evidence_backbone \
+  --enable_evidence_scaled_sigma \
+  --enable_candidate_scorer \
+  --evidence_sigma_scale_min 0.5 \
+  --evidence_sigma_scale_max 2.0 \
+  --sigma_max 2.0 \
+  --num_candidates 4 \
+  --test_num_candidates 4 \
+  --lambda_min_k 1.0 \
+  --lambda_mean_k 0.1 \
+  --lambda_boundary 0.05 \
+  --lambda_diversity 0.05 \
+  --lambda_gate_evidence 0.1 \
+  --lambda_calib 0.1 \
+  --calib_error_tau 0.1 \
+  --resume \
+  --resume_path "$STAGE8_CKPT" \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --checkpoint_dir "$EXP_DIR" \
+  --log_event_path "$EXP_DIR/events" \
+  --batch_size 1 \
+  --num_workers 0 \
+  --max_train_steps 3000 \
+  --checkpoint_interval 500 \
+  --print_freq 10 \
+  --display_id 0
+```
+
+注意：这里**不要加 `--reset_optimizer`**，因为你是从 Stage8 smoke 继续训。  
+如果你是从 Stage7d checkpoint 第一次启动 Stage8，则才加 `--reset_optimizer`。
+
+**2. 验证训练后的 Stage8 checkpoint**
+
+比如训练后 checkpoint 是：
+
+```bash
+export STAGE8_CKPT=checkpoints/stage8_candidate_scorer_3k/EC-VIAI-AV-PatchGAN_checkpoint_stepXXXXXXXXX.pth.tar
+export DATA_ROOT=/root/shared-nvme/data
+export RESULT_DIR=checkpoints/stage8_candidate_scorer_3k_test
+```
+
+验证命令：
+
+```bash
+python main.py test-viai-av -- \
+  --use_gan \
+  --lambda_gan 0.001 \
+  --enable_ec_viai_av \
+  --stochastic_adapter \
+  --enable_evidence_gate \
+  --freeze_gate_evidence_backbone \
+  --enable_evidence_scaled_sigma \
+  --enable_candidate_scorer \
+  --evidence_sigma_scale_min 0.5 \
+  --evidence_sigma_scale_max 2.0 \
+  --sigma_max 2.0 \
+  --num_candidates 4 \
+  --test_num_candidates 4 \
+  --lambda_min_k 1.0 \
+  --lambda_mean_k 0.1 \
+  --lambda_boundary 0.05 \
+  --lambda_diversity 0.05 \
+  --lambda_gate_evidence 0.1 \
+  --lambda_calib 0.1 \
+  --calib_error_tau 0.1 \
+  --resume_path "$STAGE8_CKPT" \
+  --data_root "$DATA_ROOT" \
+  --test_split_name test_av_split.txt \
+  --batch_size 1 \
+  --num_workers 0 \
+  --results_dir "$RESULT_DIR" \
+  --display_id 0
+```
+
+验证后重点看：
+
+```text
+top1_missing_l1
+candidate0_missing_l1
+best_of_k_missing_l1
+oracle_gain
+loss_candidate_scorer
+uncertainty_error_corr
+uncertainty_error_spearman
+uncertainty_best_error_corr
+uncertainty_best_error_spearman
+```
+
+判断标准：`top1_missing_l1` 最好要小于或接近 `candidate0_missing_l1`，uncertainty correlation 保持正数并变大。当前 short validation 已经说明方向可行，下一轮主要看 scorer 能不能真正超过 candidate0。

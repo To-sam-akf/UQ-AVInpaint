@@ -75,6 +75,7 @@ def print_viai_av_run_config():
         f"stochastic_adapter={getattr(hparams, 'stochastic_adapter', False)} "
         f"deterministic_adapter={getattr(hparams, 'deterministic_adapter', False)} "
         f"enable_candidate_scorer={getattr(hparams, 'enable_candidate_scorer', False)} "
+        f"train_candidate_heads_only={getattr(hparams, 'train_candidate_heads_only', False)} "
         f"save_candidates={getattr(hparams, 'save_candidates', False)} "
         f"video_perturbation={getattr(hparams, 'video_perturbation', 'none')}"
     )
@@ -93,6 +94,9 @@ def print_viai_av_run_config():
         f"evidence_sigma_scale_min={getattr(hparams, 'evidence_sigma_scale_min', 0.5)} "
         f"evidence_sigma_scale_max={getattr(hparams, 'evidence_sigma_scale_max', 2.0)} "
         f"evidence_source={getattr(hparams, 'evidence_source', 'none')} "
+        f"semantic_evidence_path={getattr(hparams, 'semantic_evidence_path', '')} "
+        f"semantic_evidence_weight={getattr(hparams, 'semantic_evidence_weight', 0.35)} "
+        f"semantic_missing_score={getattr(hparams, 'semantic_missing_score', 0.0)} "
         f"evidence_diversity_d_min={getattr(hparams, 'evidence_diversity_d_min', 0.02)} "
         f"evidence_diversity_alpha={getattr(hparams, 'evidence_diversity_alpha', 0.08)} "
         f"evidence_gate_low={getattr(hparams, 'evidence_gate_low', 0.24)} "

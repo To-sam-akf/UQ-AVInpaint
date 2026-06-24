@@ -12,6 +12,7 @@ from networks import EC_VIAI_Modules
 from networks import Image_Embedding
 from networks import Inpainting_Networks
 from networks import New_Inpainting_Networks
+from utils import semantic_evidence
 from utils import util
 
 
@@ -53,6 +54,9 @@ class VIAIAVModel(object):
         self.use_candidate_scorer = self.enable_ec_viai_av and bool(
             getattr(hparams, "enable_candidate_scorer", False)
         )
+        self.train_candidate_heads_only = bool(
+            getattr(hparams, "train_candidate_heads_only", False)
+        )
         self.freeze_gate_evidence_backbone = bool(
             getattr(hparams, "freeze_gate_evidence_backbone", False)
         )
@@ -62,6 +66,32 @@ class VIAIAVModel(object):
         self.enable_visual_evidence_aug = bool(
             getattr(hparams, "enable_visual_evidence_aug", False)
         )
+        self.evidence_source = getattr(hparams, "evidence_source", "none")
+        if self.evidence_source not in semantic_evidence.VALID_EVIDENCE_SOURCES:
+            raise ValueError(
+                f"Unsupported evidence source: {self.evidence_source}. "
+                f"Expected one of {', '.join(semantic_evidence.VALID_EVIDENCE_SOURCES)}."
+            )
+        self.semantic_evidence_weight = float(
+            getattr(hparams, "semantic_evidence_weight", 0.35)
+        )
+        self.semantic_missing_score = float(getattr(hparams, "semantic_missing_score", 0.0))
+        semantic_path = getattr(hparams, "semantic_evidence_path", "")
+        self.semantic_evidence_table = semantic_evidence.SemanticEvidenceTable(
+            semantic_path or None,
+            data_root=getattr(hparams, "data_root", None),
+            missing_score=self.semantic_missing_score,
+        )
+        if semantic_path:
+            print(
+                "[VIAI-AV] loaded semantic evidence: "
+                f"path={semantic_path} records={len(self.semantic_evidence_table.records)}"
+            )
+        elif self.evidence_source in {"semantic", "fused"}:
+            print(
+                "[VIAI-AV] semantic evidence source requested without "
+                "--semantic_evidence_path; using semantic_missing_score for all samples."
+            )
         self.visual_evidence_aug_modes = (
             EC_VIAI_Modules.normalize_visual_evidence_aug_modes(
                 getattr(
@@ -83,6 +113,13 @@ class VIAIAVModel(object):
         lambda_calib = float(getattr(hparams, "lambda_calib", 0.0))
         if lambda_calib > 0.0 and not self.use_candidate_scorer:
             raise ValueError("--lambda_calib > 0 requires --enable_candidate_scorer.")
+        if self.train_candidate_heads_only:
+            if not self.use_candidate_scorer:
+                raise ValueError(
+                    "--train_candidate_heads_only requires --enable_candidate_scorer."
+                )
+            if lambda_calib <= 0.0:
+                raise ValueError("--train_candidate_heads_only requires --lambda_calib > 0.")
         if float(getattr(hparams, "calib_error_tau", 0.1)) <= 0.0:
             raise ValueError("--calib_error_tau must be > 0.")
         self.train_num_candidates = int(getattr(hparams, "num_candidates", 1))
@@ -129,7 +166,9 @@ class VIAIAVModel(object):
         if self.use_candidate_scorer:
             self.CandidateScorer = EC_VIAI_Modules.CandidateScorer().to(self.device)
             self.UncertaintyHead = EC_VIAI_Modules.UncertaintyHead().to(self.device)
-        if self.freeze_gate_evidence_backbone:
+        if self.train_candidate_heads_only:
+            self._freeze_for_candidate_heads_only()
+        elif self.freeze_gate_evidence_backbone:
             self._set_module_requires_grad(self.Mel_Encoder, False)
             self._set_module_requires_grad(self.VideoEncoder, False)
 
@@ -143,24 +182,30 @@ class VIAIAVModel(object):
         self.criterion_uncertainty_calib = nn.SmoothL1Loss()
 
         generator_params = []
-        if not self.freeze_gate_evidence_backbone:
-            generator_params += list(self.Mel_Encoder.parameters())
-            generator_params += list(self.VideoEncoder.parameters())
-        generator_params += list(self.Mel_Decoder.parameters())
-        if self.use_bottleneck_adapter:
-            generator_params += list(self.BottleneckAdapter.parameters())
-        if self.use_evidence_gate:
-            generator_params += list(self.EvidenceFusionGate.parameters())
-        if self.use_candidate_scorer:
+        if self.train_candidate_heads_only:
             generator_params += list(self.CandidateScorer.parameters())
             generator_params += list(self.UncertaintyHead.parameters())
+        else:
+            if not self.freeze_gate_evidence_backbone:
+                generator_params += list(self.Mel_Encoder.parameters())
+                generator_params += list(self.VideoEncoder.parameters())
+            generator_params += list(self.Mel_Decoder.parameters())
+            if self.use_bottleneck_adapter:
+                generator_params += list(self.BottleneckAdapter.parameters())
+            if self.use_evidence_gate:
+                generator_params += list(self.EvidenceFusionGate.parameters())
+            if self.use_candidate_scorer:
+                generator_params += list(self.CandidateScorer.parameters())
+                generator_params += list(self.UncertaintyHead.parameters())
+        if not generator_params:
+            raise ValueError("optimizer_G received no trainable parameters.")
         self.optimizer_G = torch.optim.Adam(
             generator_params,
             lr=hparams.lr,
             betas=(hparams.beta1, hparams.beta2),
         )
         self.optimizer_D = None
-        if self.use_gan:
+        if self.use_gan and not self.train_candidate_heads_only:
             self.optimizer_D = torch.optim.Adam(
                 self.netD.parameters(),
                 lr=hparams.lr,
@@ -218,9 +263,13 @@ class VIAIAVModel(object):
         self.eta1_item = 0.0
         self.eta2_item = 0.0
         self.evidence_score = torch.zeros(1, 1, device=self.device)
+        self.heuristic_evidence_score = torch.zeros(1, 1, device=self.device)
+        self.semantic_evidence_score = torch.zeros(1, 1, device=self.device)
         self.evidence_mean_item = 0.0
         self.evidence_min_item = 0.0
         self.evidence_max_item = 0.0
+        self.heuristic_evidence_mean_item = 0.0
+        self.semantic_evidence_mean_item = 0.0
         self.gate_value = torch.ones(1, 1, 1, 1, device=self.device)
         self.gate_target = torch.ones(1, 1, 1, 1, device=self.device)
         self.gate_mean_item = 1.0
@@ -286,15 +335,48 @@ class VIAIAVModel(object):
         self.mel_candidates = torch.zeros(1, 1, 1, mel_height, mel_width, device=self.device)
         self.mel_completed_candidates = torch.zeros_like(self.mel_candidates)
         self.mel_completed_pred = torch.zeros(1, 1, mel_height, mel_width, device=self.device)
+        self.semantic_evidence_paths = []
+        self.semantic_evidence_override = None
         self.loaded_stage = self._stage_name()
         setattr(self.hparams, "loaded_stage", self.loaded_stage)
         self._print_loss_configuration()
 
     def _set_module_requires_grad(self, module, requires_grad):
+        if module is None:
+            return
         for parameter in module.parameters():
             parameter.requires_grad = requires_grad
 
+    def _freeze_for_candidate_heads_only(self):
+        frozen_modules = [
+            self.Mel_Encoder,
+            self.VideoEncoder,
+            self.Mel_Decoder,
+            self.EvidenceEstimator,
+            self.BottleneckAdapter,
+            self.EvidenceFusionGate,
+            self.netD,
+        ]
+        for module in frozen_modules:
+            self._set_module_requires_grad(module, False)
+        self._set_module_requires_grad(self.CandidateScorer, True)
+        self._set_module_requires_grad(self.UncertaintyHead, True)
+
     def _set_generator_train_modes(self):
+        if getattr(self, "train_candidate_heads_only", False):
+            self.Mel_Encoder.eval()
+            self.VideoEncoder.eval()
+            self.Mel_Decoder.eval()
+            self.EvidenceEstimator.eval()
+            if self.use_bottleneck_adapter:
+                self.BottleneckAdapter.eval()
+            if self.use_evidence_gate:
+                self.EvidenceFusionGate.eval()
+            if self.use_gan:
+                self.netD.eval()
+            self.CandidateScorer.train()
+            self.UncertaintyHead.train()
+            return
         if self.freeze_gate_evidence_backbone:
             self.Mel_Encoder.eval()
             self.VideoEncoder.eval()
@@ -335,9 +417,13 @@ class VIAIAVModel(object):
             f"use_bottleneck_adapter={self.use_bottleneck_adapter} "
             f"use_evidence_gate={self.use_evidence_gate} "
             f"use_candidate_scorer={self.use_candidate_scorer} "
+            f"train_candidate_heads_only={self.train_candidate_heads_only} "
             f"freeze_gate_evidence_backbone={self.freeze_gate_evidence_backbone} "
             f"enable_evidence_scaled_sigma={self.enable_evidence_scaled_sigma} "
             f"enable_visual_evidence_aug={self.enable_visual_evidence_aug} "
+            f"evidence_source={self.evidence_source} "
+            f"semantic_evidence_weight={self.semantic_evidence_weight} "
+            f"semantic_missing_score={self.semantic_missing_score} "
             f"num_candidates={self.train_num_candidates} "
             f"test_num_candidates={self.test_num_candidates}"
         )
@@ -393,6 +479,7 @@ class VIAIAVModel(object):
         self.g_batch = g_batch.to(self.device) if g_batch is not None else None
         self.input_lengths = input_lengths.to(self.device)
         self.path_batch = path_batch
+        self.set_semantic_evidence_paths(path_batch)
 
         if self.mel_target is None:
             raise ValueError("Local conditioning Mel target is required for VIAI-AV training")
@@ -404,6 +491,45 @@ class VIAIAVModel(object):
         self.mel_input_4d = self.mel_input.unsqueeze(1)
         self.missing_mask = self.missing_mask.to(self.device)
         self.visual_evidence_aug_mode = "none"
+
+    def set_semantic_evidence_paths(self, paths):
+        self.semantic_evidence_paths = list(paths)
+        self.semantic_evidence_override = None
+
+    def set_semantic_evidence_override(self, value):
+        self.semantic_evidence_override = value
+
+    def _semantic_evidence_tensor(self, reference):
+        batch_size = reference.size(0)
+        override = self.semantic_evidence_override
+        if override is not None:
+            if torch.is_tensor(override):
+                tensor = override.to(device=reference.device, dtype=reference.dtype)
+                return tensor.reshape(batch_size, -1).mean(dim=1, keepdim=True)
+            if isinstance(override, (list, tuple)):
+                scores = list(override)
+            else:
+                scores = [float(override)] * batch_size
+        else:
+            scores = self.semantic_evidence_table.lookup_scores(
+                self.semantic_evidence_paths[:batch_size]
+            )
+        if len(scores) != batch_size:
+            raise ValueError(
+                "Semantic evidence score count must match batch size; "
+                f"got {len(scores)} for batch_size={batch_size}."
+            )
+        return semantic_evidence.semantic_scores_to_tensor(scores, reference)
+
+    def _resolve_evidence_score(self, heuristic_evidence):
+        self.heuristic_evidence_score = heuristic_evidence
+        self.semantic_evidence_score = self._semantic_evidence_tensor(heuristic_evidence)
+        return semantic_evidence.combine_evidence_scores(
+            self.heuristic_evidence_score,
+            self.semantic_evidence_score,
+            source=self.evidence_source,
+            weight=self.semantic_evidence_weight,
+        )
 
     def _set_visual_evidence_aug_mode(self, mode):
         self.visual_evidence_aug_mode = mode
@@ -720,12 +846,13 @@ class VIAIAVModel(object):
         self.mel_net_norm = util.l2_norm(self.mel_target_feature_flat.detach())
         self.video_net_norm = util.l2_norm(self.video_feature_flat)
         with torch.no_grad():
-            self.evidence_score = self.EvidenceEstimator(
+            heuristic_evidence = self.EvidenceEstimator(
                 self.video_feature,
                 self.flow_batch,
                 self.mel_target_feature_flat,
                 self.video_feature_flat,
             )
+            self.evidence_score = self._resolve_evidence_score(heuristic_evidence)
         self.gate_target = self._gate_target_from_evidence(self.evidence_score).view(
             self.video_feature.size(0),
             1,
@@ -1154,10 +1281,15 @@ class VIAIAVModel(object):
         self._forward_inpainter()
         self._compute_losses(global_step)
         self.optimizer_G.zero_grad()
-        self.loss_total.backward()
+        generator_backward_loss = (
+            self.weighted_loss_calib
+            if self.train_candidate_heads_only
+            else self.loss_total
+        )
+        generator_backward_loss.backward()
         self.optimizer_G.step()
 
-        if self.use_gan:
+        if self.use_gan and not self.train_candidate_heads_only:
             self.netD.train()
             for parameter in self.netD.parameters():
                 parameter.requires_grad = True
@@ -1165,6 +1297,10 @@ class VIAIAVModel(object):
             self._compute_discriminator_loss()
             self.loss_D.backward()
             self.optimizer_D.step()
+        elif self.use_gan:
+            self.loss_D_real = self._zero_loss_like(self.loss_av_gen)
+            self.loss_D_fake = self._zero_loss_like(self.loss_av_gen)
+            self.loss_D = self._zero_loss_like(self.loss_av_gen)
         self.current_lr = self.optimizer_G.param_groups[0]["lr"]
 
     def test(self, global_step=0):
@@ -1280,6 +1416,12 @@ class VIAIAVModel(object):
         self.evidence_mean_item = float(self.evidence_score.detach().mean().cpu().item())
         self.evidence_min_item = float(self.evidence_score.detach().min().cpu().item())
         self.evidence_max_item = float(self.evidence_score.detach().max().cpu().item())
+        self.heuristic_evidence_mean_item = float(
+            self.heuristic_evidence_score.detach().mean().cpu().item()
+        )
+        self.semantic_evidence_mean_item = float(
+            self.semantic_evidence_score.detach().mean().cpu().item()
+        )
         self.gate_mean_item = float(self.gate_value.detach().mean().cpu().item())
         self.gate_min_item = float(self.gate_value.detach().min().cpu().item())
         self.gate_max_item = float(self.gate_value.detach().max().cpu().item())
@@ -1445,6 +1587,21 @@ class VIAIAVModel(object):
         writer.add_scalar(f"{prefix}/evidence/mean", self.evidence_mean_item, step)
         writer.add_scalar(f"{prefix}/evidence/min", self.evidence_min_item, step)
         writer.add_scalar(f"{prefix}/evidence/max", self.evidence_max_item, step)
+        writer.add_scalar(
+            f"{prefix}/heuristic_evidence/mean",
+            self.heuristic_evidence_mean_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/semantic_evidence/mean",
+            self.semantic_evidence_mean_item,
+            step,
+        )
+        writer.add_scalar(
+            f"{prefix}/evidence/fused_mean",
+            self.evidence_mean_item,
+            step,
+        )
         writer.add_scalar(f"{prefix}/gate/mean", self.gate_mean_item, step)
         writer.add_scalar(f"{prefix}/gate/min", self.gate_min_item, step)
         writer.add_scalar(f"{prefix}/gate/max", self.gate_max_item, step)
@@ -1542,6 +1699,9 @@ class VIAIAVModel(object):
             "enable_candidate_scorer": bool(
                 getattr(self.hparams, "enable_candidate_scorer", False)
             ),
+            "train_candidate_heads_only": bool(
+                getattr(self.hparams, "train_candidate_heads_only", False)
+            ),
             "calib_error_tau": float(getattr(self.hparams, "calib_error_tau", 0.1)),
             "lambda_calib": float(getattr(self.hparams, "lambda_calib", 0.0)),
             "freeze_gate_evidence_backbone": bool(
@@ -1549,6 +1709,14 @@ class VIAIAVModel(object):
             ),
             "enable_evidence_scaled_sigma": bool(
                 getattr(self.hparams, "enable_evidence_scaled_sigma", False)
+            ),
+            "evidence_source": getattr(self.hparams, "evidence_source", "none"),
+            "semantic_evidence_path": getattr(self.hparams, "semantic_evidence_path", ""),
+            "semantic_evidence_weight": float(
+                getattr(self.hparams, "semantic_evidence_weight", 0.35)
+            ),
+            "semantic_missing_score": float(
+                getattr(self.hparams, "semantic_missing_score", 0.0)
             ),
             "evidence_sigma_scale_min": float(
                 getattr(self.hparams, "evidence_sigma_scale_min", 0.5)
@@ -1594,7 +1762,7 @@ class VIAIAVModel(object):
             checkpoint["netD"] = self.netD.state_dict()
             checkpoint["optimizer_D"] = (
                 self.optimizer_D.state_dict()
-                if self.hparams.save_optimizer_state
+                if self.hparams.save_optimizer_state and self.optimizer_D is not None
                 else None
             )
         torch.save(checkpoint, checkpoint_path)
@@ -1742,13 +1910,18 @@ class VIAIAVModel(object):
                 f"[VIAI-AV] checkpoint stage={checkpoint_stage}; "
                 f"current model stage={self.loaded_stage}"
             )
-        if not reset_optimizer:
+        if self.train_candidate_heads_only:
+            print(
+                "[VIAI-AV] train_candidate_heads_only=True; skipped checkpoint "
+                "optimizer states and initialized heads-only optimizers"
+            )
+        elif not reset_optimizer:
             self._load_optimizer_state(
                 self.optimizer_G,
                 checkpoint.get("optimizer_G"),
                 "optimizer_G",
             )
-            if self.use_gan:
+            if self.use_gan and self.optimizer_D is not None:
                 self._load_optimizer_state(
                     self.optimizer_D,
                     checkpoint.get("optimizer_D"),

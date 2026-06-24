@@ -12,6 +12,16 @@ def _as_bchw(tensor):
         return tensor
     raise ValueError("Expected a 3D (B, C, T) or 4D (B, 1, C, T) tensor.")
 
+
+def _as_bkchw(tensor):
+    if tensor.dim() == 4:
+        return tensor.unsqueeze(1)
+    if tensor.dim() == 5:
+        return tensor
+    raise ValueError(
+        "Expected a 4D (B, 1, C, T) or 5D (B, K, 1, C, T) Mel tensor."
+    )
+
 # 只替换 missing 区域”的拼接图
 def compose_inpainted_mel(mel_input, mel_pred, missing_mask):
     """Return the final inpainted Mel: keep known bins, replace only the gap."""
@@ -77,6 +87,284 @@ def compute_viai_a_metrics(mel_pred, mel_target, missing_mask, compute_ssim=True
         "ssim_full": None if ssim_full_sum is None else ssim_full_sum / batch_size,
     }
     return metrics
+
+
+def _pairwise_missing_l1(mel_candidates, missing_mask):
+    batch_size = mel_candidates.size(0)
+    num_candidates = mel_candidates.size(1)
+    if num_candidates < 2:
+        return torch.zeros(
+            batch_size,
+            device=mel_candidates.device,
+            dtype=mel_candidates.dtype,
+        )
+    mask = _as_bchw(missing_mask).detach().unsqueeze(1).to(
+        device=mel_candidates.device,
+        dtype=mel_candidates.dtype,
+    )
+    pairwise_abs = torch.abs(
+        mel_candidates.unsqueeze(2) - mel_candidates.unsqueeze(1)
+    )
+    pairwise_l1 = (pairwise_abs * mask.unsqueeze(2)).sum(dim=(3, 4, 5))
+    pairwise_den = torch.clamp(mask.sum(dim=(2, 3, 4)), min=1.0).view(
+        batch_size,
+        1,
+        1,
+    )
+    pairwise_l1 = pairwise_l1 / pairwise_den
+    pair_mask = torch.triu(
+        torch.ones(
+            num_candidates,
+            num_candidates,
+            device=mel_candidates.device,
+            dtype=torch.bool,
+        ),
+        diagonal=1,
+    )
+    return pairwise_l1[:, pair_mask].mean(dim=1)
+
+
+def compute_boundary_delta_error(
+    mel_completed_candidates,
+    mel_target,
+    missing_span,
+    top1_indices=None,
+):
+    """Compute candidate boundary delta errors around the missing span.
+
+    The metric compares first-order time deltas at the left and right edges of
+    the completed Mel against the target Mel. Invalid edges, such as a gap that
+    starts at frame 0, are skipped.
+    """
+    completed = _as_bkchw(mel_completed_candidates).detach()
+    target = _as_bchw(mel_target).detach().to(
+        device=completed.device,
+        dtype=completed.dtype,
+    )
+    batch_size, num_candidates = completed.shape[:2]
+    if top1_indices is None:
+        top1_indices = torch.zeros(
+            batch_size,
+            device=completed.device,
+            dtype=torch.long,
+        )
+    else:
+        top1_indices = top1_indices.to(device=completed.device, dtype=torch.long)
+
+    start, end = missing_span
+    start = int(start)
+    end = int(end)
+    time_steps = int(target.size(-1))
+    edge_errors = []
+    if 0 < start < time_steps:
+        pred_delta = completed[..., start] - completed[..., start - 1]
+        target_delta = (target[..., start] - target[..., start - 1]).unsqueeze(1)
+        edge_errors.append(torch.abs(pred_delta - target_delta).mean(dim=(2, 3)))
+    if 0 < end < time_steps:
+        pred_delta = completed[..., end] - completed[..., end - 1]
+        target_delta = (target[..., end] - target[..., end - 1]).unsqueeze(1)
+        edge_errors.append(torch.abs(pred_delta - target_delta).mean(dim=(2, 3)))
+
+    if edge_errors:
+        candidate_error = sum(edge_errors) / len(edge_errors)
+    else:
+        candidate_error = torch.zeros(
+            batch_size,
+            num_candidates,
+            device=completed.device,
+            dtype=completed.dtype,
+        )
+    top1_error = torch.gather(
+        candidate_error,
+        dim=1,
+        index=top1_indices.view(-1, 1),
+    ).squeeze(1)
+    return {
+        "candidate_boundary_delta_error": candidate_error,
+        "top1_boundary_delta_error_per_sample": top1_error,
+        "best_boundary_delta_error_per_sample": candidate_error.min(dim=1).values,
+        "mean_boundary_delta_error_per_sample": candidate_error.mean(dim=1),
+    }
+
+
+def compute_multi_candidate_metrics(
+    mel_candidates,
+    mel_completed_candidates,
+    mel_target,
+    missing_mask,
+    top1_indices=None,
+    candidate_pi=None,
+    missing_span=None,
+):
+    """Return per-sample multi-candidate inpainting metrics."""
+    candidates = _as_bkchw(mel_candidates).detach()
+    completed = _as_bkchw(mel_completed_candidates).detach().to(
+        device=candidates.device,
+        dtype=candidates.dtype,
+    )
+    target = _as_bchw(mel_target).detach().to(
+        device=candidates.device,
+        dtype=candidates.dtype,
+    )
+    mask = _as_bchw(missing_mask).detach().to(
+        device=candidates.device,
+        dtype=candidates.dtype,
+    )
+    batch_size, num_candidates = candidates.shape[:2]
+    if top1_indices is None:
+        top1_indices = torch.zeros(
+            batch_size,
+            device=candidates.device,
+            dtype=torch.long,
+        )
+    else:
+        top1_indices = top1_indices.to(device=candidates.device, dtype=torch.long)
+
+    target = target.unsqueeze(1)
+    mask = mask.unsqueeze(1)
+    candidate_abs = torch.abs(candidates - target) * mask
+    missing_den = torch.clamp(mask.sum(dim=(2, 3, 4)), min=1.0)
+    candidate_missing_l1 = candidate_abs.sum(dim=(2, 3, 4)) / missing_den
+    top1_missing_l1 = torch.gather(
+        candidate_missing_l1,
+        dim=1,
+        index=top1_indices.view(-1, 1),
+    ).squeeze(1)
+    best_missing_l1 = candidate_missing_l1.min(dim=1).values
+    mean_missing_l1 = candidate_missing_l1.mean(dim=1)
+    candidate0_missing_l1 = candidate_missing_l1[:, 0]
+    pairwise_mel_l1 = _pairwise_missing_l1(candidates, missing_mask)
+    metrics = {
+        "candidate_missing_l1": candidate_missing_l1,
+        "top1_missing_l1_per_sample": top1_missing_l1,
+        "best_of_k_missing_l1_per_sample": best_missing_l1,
+        "mean_k_missing_l1_per_sample": mean_missing_l1,
+        "candidate0_missing_l1_per_sample": candidate0_missing_l1,
+        "random_expected_missing_l1_per_sample": mean_missing_l1,
+        "oracle_gain_per_sample": top1_missing_l1 - best_missing_l1,
+        "candidate_pairwise_mel_l1_per_sample": pairwise_mel_l1,
+        "top1_indices": top1_indices,
+    }
+    if candidate_pi is not None:
+        metrics["candidate_pi"] = candidate_pi.detach().to(
+            device=candidates.device,
+            dtype=candidates.dtype,
+        )
+    if missing_span is not None:
+        metrics.update(
+            compute_boundary_delta_error(
+                completed,
+                mel_target,
+                missing_span,
+                top1_indices=top1_indices,
+            )
+        )
+    return metrics
+
+
+def compute_risk_coverage_curve(uncertainty, top1_error, num_points=20):
+    uncertainty = np.asarray(uncertainty, dtype=np.float64).reshape(-1)
+    top1_error = np.asarray(top1_error, dtype=np.float64).reshape(-1)
+    finite = np.isfinite(uncertainty) & np.isfinite(top1_error)
+    uncertainty = uncertainty[finite]
+    top1_error = top1_error[finite]
+    if uncertainty.size == 0:
+        return []
+    order = np.argsort(uncertainty, kind="mergesort")
+    uncertainty = uncertainty[order]
+    top1_error = top1_error[order]
+    num_points = max(1, int(num_points))
+    coverages = np.linspace(1.0 / num_points, 1.0, num_points)
+    rows = []
+    for coverage in coverages:
+        retained_count = int(np.ceil(float(coverage) * uncertainty.size))
+        retained_count = min(max(retained_count, 1), uncertainty.size)
+        retained_error = top1_error[:retained_count]
+        rows.append(
+            {
+                "coverage": float(retained_count / uncertainty.size),
+                "retained_count": int(retained_count),
+                "uncertainty_threshold": float(uncertainty[retained_count - 1]),
+                "mean_top1_error": float(retained_error.mean()),
+            }
+        )
+    return rows
+
+
+def compute_calibration_bins(
+    uncertainty,
+    top1_error,
+    best_error=None,
+    oracle_gain=None,
+    evidence=None,
+    pairwise=None,
+    num_bins=10,
+):
+    uncertainty = np.asarray(uncertainty, dtype=np.float64).reshape(-1)
+    top1_error = np.asarray(top1_error, dtype=np.float64).reshape(-1)
+    count = min(uncertainty.size, top1_error.size)
+    values = {
+        "uncertainty": uncertainty[:count],
+        "top1_error": top1_error[:count],
+        "best_error": np.asarray(
+            top1_error if best_error is None else best_error,
+            dtype=np.float64,
+        ).reshape(-1)[:count],
+        "oracle_gain": np.asarray(
+            np.zeros(count) if oracle_gain is None else oracle_gain,
+            dtype=np.float64,
+        ).reshape(-1)[:count],
+        "evidence": np.asarray(
+            np.zeros(count) if evidence is None else evidence,
+            dtype=np.float64,
+        ).reshape(-1)[:count],
+        "pairwise": np.asarray(
+            np.zeros(count) if pairwise is None else pairwise,
+            dtype=np.float64,
+        ).reshape(-1)[:count],
+    }
+    finite = np.ones(count, dtype=bool)
+    for array in values.values():
+        finite &= np.isfinite(array)
+    if count == 0:
+        finite = np.zeros(0, dtype=bool)
+    for key in values:
+        values[key] = values[key][finite]
+    num_bins = max(1, int(num_bins))
+    rows = []
+    for index in range(num_bins):
+        low = index / num_bins
+        high = (index + 1) / num_bins
+        if index == num_bins - 1:
+            in_bin = (values["uncertainty"] >= low) & (values["uncertainty"] <= high)
+        else:
+            in_bin = (values["uncertainty"] >= low) & (values["uncertainty"] < high)
+        bin_count = int(in_bin.sum())
+        row = {
+            "bin_index": int(index),
+            "bin_low": float(low),
+            "bin_high": float(high),
+            "count": bin_count,
+            "avg_uncertainty": 0.0,
+            "avg_top1_error": 0.0,
+            "avg_best_error": 0.0,
+            "avg_oracle_gain": 0.0,
+            "avg_evidence": 0.0,
+            "avg_pairwise": 0.0,
+        }
+        if bin_count > 0:
+            row.update(
+                {
+                    "avg_uncertainty": float(values["uncertainty"][in_bin].mean()),
+                    "avg_top1_error": float(values["top1_error"][in_bin].mean()),
+                    "avg_best_error": float(values["best_error"][in_bin].mean()),
+                    "avg_oracle_gain": float(values["oracle_gain"][in_bin].mean()),
+                    "avg_evidence": float(values["evidence"][in_bin].mean()),
+                    "avg_pairwise": float(values["pairwise"][in_bin].mean()),
+                }
+            )
+        rows.append(row)
+    return rows
 
 
 def mel_image_batches(mel_input, mel_pred, mel_target, max_items=4):

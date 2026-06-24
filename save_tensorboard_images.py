@@ -28,10 +28,10 @@ from tensorboard.backend.event_processing.event_accumulator import EventAccumula
 # =============================================================================
 
 # TensorBoard event directory or a single events.out.tfevents.* file.
-EVENTS_DIR = Path("/home/sanmu/VIAIpro/checkpoints/stage7d_evidence_scaled_sigma_3k/events")
+EVENTS_DIR = Path("/home/sanmu/VIAIpro/checkpoints/stage8_candidate_heads_only_from27750/events")
 
 # Output directory for PNG curve images.
-OUTPUT_DIR = Path("/home/sanmu/VIAIpro/tensorboard_curve_images/stage7d_evidence_scaled_sigma_3k")
+OUTPUT_DIR = Path("/home/sanmu/VIAIpro/tensorboard_curve_images/stage8_candidate_heads_only_from27750")
     
 # Scalar tags to export. Shell-style wildcards are supported.
 # Examples:

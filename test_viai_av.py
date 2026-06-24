@@ -3,10 +3,12 @@ import json
 import os
 import re
 import sys
+import zlib
 
 import numpy as np
 import torch
 import torch.backends.cudnn as cudnn
+import torch.nn.functional as F
 from tqdm import tqdm
 
 import Options_inpainting
@@ -15,6 +17,9 @@ from Models.VIAI_AV_inpainting import VIAIAVModel
 from utils import util
 from utils.viai_a_metrics import (
     compose_inpainted_mel,
+    compute_calibration_bins,
+    compute_multi_candidate_metrics,
+    compute_risk_coverage_curve,
     compute_viai_a_metrics,
     save_mel_comparison_batch,
 )
@@ -47,7 +52,11 @@ RESULT_FIELDS = [
     "freeze_gate_evidence_backbone",
     "enable_evidence_scaled_sigma",
     "enable_candidate_scorer",
+    "train_candidate_heads_only",
     "evidence_source",
+    "semantic_evidence_path",
+    "semantic_evidence_weight",
+    "semantic_missing_score",
     "enable_visual_evidence_aug",
     "visual_evidence_aug_prob",
     "visual_evidence_aug_modes",
@@ -58,6 +67,13 @@ RESULT_FIELDS = [
     "calib_error_tau",
     "save_candidates",
     "video_perturbation",
+    "wrong_video_effective_mode",
+    "wrong_video_cross_instrument_available",
+    "wrong_video_num_instruments",
+    "video_blur_kernel",
+    "video_frame_drop_stride",
+    "video_temporal_shift_frames",
+    "calibration_bins",
     "num_samples",
     "loss_total",
     "loss_av_gen",
@@ -97,6 +113,15 @@ RESULT_FIELDS = [
     "uncertainty_best_error_spearman",
     "uncertainty_corr_count",
     "candidate_pairwise_distance",
+    "candidate_pairwise_mel_l1",
+    "boundary_delta_error_top1",
+    "boundary_delta_error_best",
+    "boundary_delta_error_mean",
+    "evidence_mean",
+    "evidence_min",
+    "evidence_max",
+    "heuristic_evidence_mean",
+    "semantic_evidence_mean",
     "evidence_diversity_gap",
     "gate_mean",
     "gate_target_mean",
@@ -141,6 +166,12 @@ RESULT_FIELDS = [
     "vocoder_n_iter",
     "vocoder_output_dir",
     "vocoder_num_samples",
+    "candidate_image_dir",
+    "candidate_vocoder_dir",
+    "candidate_vocoder_num_samples",
+    "per_sample_metrics_path",
+    "risk_coverage_path",
+    "calibration_bins_path",
 ]
 
 
@@ -197,8 +228,13 @@ def print_viai_av_test_config():
         f"stochastic_adapter={getattr(hparams, 'stochastic_adapter', False)} "
         f"deterministic_adapter={getattr(hparams, 'deterministic_adapter', False)} "
         f"enable_candidate_scorer={getattr(hparams, 'enable_candidate_scorer', False)} "
+        f"train_candidate_heads_only={getattr(hparams, 'train_candidate_heads_only', False)} "
         f"save_candidates={getattr(hparams, 'save_candidates', False)} "
-        f"video_perturbation={getattr(hparams, 'video_perturbation', 'none')}"
+        f"video_perturbation={getattr(hparams, 'video_perturbation', 'none')} "
+        f"video_blur_kernel={getattr(hparams, 'video_blur_kernel', 9)} "
+        f"video_frame_drop_stride={getattr(hparams, 'video_frame_drop_stride', 2)} "
+        f"video_temporal_shift_frames={getattr(hparams, 'video_temporal_shift_frames', 6)} "
+        f"calibration_bins={getattr(hparams, 'calibration_bins', 10)}"
     )
     print(
         "[VIAI-AV test] EC losses/evidence: "
@@ -215,6 +251,9 @@ def print_viai_av_test_config():
         f"evidence_sigma_scale_min={getattr(hparams, 'evidence_sigma_scale_min', 0.5)} "
         f"evidence_sigma_scale_max={getattr(hparams, 'evidence_sigma_scale_max', 2.0)} "
         f"evidence_source={getattr(hparams, 'evidence_source', 'none')} "
+        f"semantic_evidence_path={getattr(hparams, 'semantic_evidence_path', '')} "
+        f"semantic_evidence_weight={getattr(hparams, 'semantic_evidence_weight', 0.35)} "
+        f"semantic_missing_score={getattr(hparams, 'semantic_missing_score', 0.0)} "
         f"evidence_diversity_d_min={getattr(hparams, 'evidence_diversity_d_min', 0.02)} "
         f"evidence_diversity_alpha={getattr(hparams, 'evidence_diversity_alpha', 0.08)} "
         f"evidence_gate_low={getattr(hparams, 'evidence_gate_low', 0.24)} "
@@ -345,15 +384,493 @@ def uncertainty_correlations(uncertainty_values, top1_errors, best_errors):
     }
 
 
+def safe_token(value):
+    token = re.sub(r"[^A-Za-z0-9_.-]+", "-", str(value)).strip("-")
+    return token if token else "none"
+
+
+def perturbation_mode():
+    return getattr(hparams, "video_perturbation", "none")
+
+
+def perturbation_tag():
+    return f"perturb-{safe_token(perturbation_mode())}"
+
+
 def mel_image_output_dir(results_dir, checkpoint_step_value):
-    return os.path.join(
+    base_dir = os.path.join(
         results_dir,
         "mel-image",
         f"step{format_step(checkpoint_step_value)}",
     )
+    mode = perturbation_mode()
+    if mode == "none":
+        return base_dir
+    return os.path.join(base_dir, perturbation_tag())
 
 
-def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None):
+def candidate_image_output_dir(results_dir, checkpoint_step_value):
+    return os.path.join(
+        results_dir,
+        "mel-candidates",
+        f"step{format_step(checkpoint_step_value)}",
+        perturbation_tag(),
+    )
+
+
+def candidate_vocoder_output_dir(results_dir, checkpoint_step_value):
+    return os.path.join(
+        results_dir,
+        "wav-candidates",
+        f"step{format_step(checkpoint_step_value)}",
+        perturbation_tag(),
+    )
+
+
+def per_sample_metrics_path(results_dir, checkpoint_step_value):
+    return os.path.join(
+        results_dir,
+        "sample-metrics",
+        f"step{format_step(checkpoint_step_value)}_{perturbation_tag()}_samples.csv",
+    )
+
+
+def risk_coverage_path(results_dir, checkpoint_step_value):
+    return os.path.join(
+        results_dir,
+        "risk-coverage",
+        f"step{format_step(checkpoint_step_value)}_{perturbation_tag()}_risk_coverage.csv",
+    )
+
+
+def calibration_bins_path(results_dir, checkpoint_step_value):
+    return os.path.join(
+        results_dir,
+        "calibration",
+        f"step{format_step(checkpoint_step_value)}_{perturbation_tag()}_bins.csv",
+    )
+
+
+def _sample_dir_from_path(path):
+    path = os.path.abspath(str(path))
+    if os.path.basename(path).isdigit():
+        return os.path.dirname(path)
+    return path
+
+
+def read_split_sample_dirs(data_root, split_name):
+    split_path = os.path.join(data_root, split_name)
+    sample_dirs = []
+    with open(split_path, "r", encoding="utf-8") as handle:
+        for line in handle:
+            line = line.strip()
+            if not line:
+                continue
+            sample_dir = line.split("|")[0]
+            if not os.path.isabs(sample_dir):
+                sample_dir = os.path.join(data_root, sample_dir)
+            sample_dirs.append(os.path.abspath(sample_dir))
+    return sample_dirs
+
+
+def instrument_from_sample_dir(sample_dir):
+    parts = os.path.normpath(str(sample_dir)).split(os.sep)
+    if "processed" in parts:
+        index = parts.index("processed")
+        if index + 1 < len(parts):
+            return parts[index + 1]
+    if len(parts) >= 2:
+        return parts[-5] if len(parts) >= 5 else parts[-2]
+    raise ValueError(f"Cannot infer instrument from sample path: {sample_dir}")
+
+
+def wrong_video_effective_mode(mode):
+    if mode == "wrong_video":
+        return "wrong_video_any"
+    return mode
+
+
+class WrongVideoSampler:
+    def __init__(self, hparams):
+        self.hparams = hparams
+        self.mode = wrong_video_effective_mode(
+            getattr(hparams, "video_perturbation", "none")
+        )
+        self.sample_dirs = read_split_sample_dirs(
+            hparams.data_root,
+            hparams.test_split_name,
+        )
+        if len(self.sample_dirs) < 2:
+            raise RuntimeError(
+                "--video_perturbation wrong_video/wrong_video_any/"
+                "wrong_video_cross_instrument requires at least 2 test samples."
+            )
+        self.index_by_dir = {
+            os.path.abspath(sample_dir): index
+            for index, sample_dir in enumerate(self.sample_dirs)
+        }
+        self.instrument_by_dir = {
+            os.path.abspath(sample_dir): instrument_from_sample_dir(sample_dir)
+            for sample_dir in self.sample_dirs
+        }
+        self.sample_dirs_by_instrument = {}
+        for sample_dir in self.sample_dirs:
+            instrument = self.instrument_by_dir[os.path.abspath(sample_dir)]
+            self.sample_dirs_by_instrument.setdefault(instrument, []).append(sample_dir)
+        self.instruments = sorted(self.sample_dirs_by_instrument)
+        self.cross_instrument_available = len(self.instruments) >= 2
+        if self.mode == "wrong_video_cross_instrument" and not self.cross_instrument_available:
+            raise RuntimeError(
+                "--video_perturbation wrong_video_cross_instrument requires "
+                "at least 2 instruments in the test split."
+            )
+        self.last_wrong_dirs = []
+        self.last_source_instruments = []
+        self.last_wrong_instruments = []
+        self.last_is_cross_instrument = []
+
+    def _wrong_any_dir_for(self, sample_dir):
+        index = self.index_by_dir[sample_dir]
+        return self.sample_dirs[(index + 1) % len(self.sample_dirs)]
+
+    def _wrong_cross_instrument_dir_for(self, sample_dir):
+        source_instrument = self.instrument_by_dir[sample_dir]
+        source_instrument_index = self.instruments.index(source_instrument)
+        target_instrument = self.instruments[
+            (source_instrument_index + 1) % len(self.instruments)
+        ]
+        target_dirs = self.sample_dirs_by_instrument[target_instrument]
+        source_index = self.index_by_dir[sample_dir]
+        return target_dirs[source_index % len(target_dirs)]
+
+    def wrong_dir_for(self, sample_path):
+        sample_dir = _sample_dir_from_path(sample_path)
+        if sample_dir not in self.index_by_dir:
+            raise RuntimeError(
+                "Cannot map sample path to test split for wrong_video: "
+                f"{sample_path}"
+            )
+        if self.mode == "wrong_video_cross_instrument":
+            return self._wrong_cross_instrument_dir_for(sample_dir)
+        if self.mode in {"wrong_video", "wrong_video_any"}:
+            return self._wrong_any_dir_for(sample_dir)
+        raise RuntimeError(f"Unsupported wrong video mode: {self.mode}")
+
+    def load_batch(self, paths, reference_video, reference_flow):
+        videos = []
+        flows = []
+        self.last_wrong_dirs = []
+        self.last_source_instruments = []
+        self.last_wrong_instruments = []
+        self.last_is_cross_instrument = []
+        for sample_path in paths:
+            source_dir = _sample_dir_from_path(sample_path)
+            wrong_dir = self.wrong_dir_for(sample_path)
+            source_instrument = self.instrument_by_dir[source_dir]
+            wrong_instrument = self.instrument_by_dir[os.path.abspath(wrong_dir)]
+            numpy_state = np.random.get_state()
+            try:
+                seed = zlib.crc32(wrong_dir.encode("utf-8")) & 0xFFFFFFFF
+                np.random.seed(seed)
+                video_block, flow_block, _start = av_loader.sample_data_new(
+                    wrong_dir,
+                    train=False,
+                    hparams=self.hparams,
+                )
+            finally:
+                np.random.set_state(numpy_state)
+            self.last_wrong_dirs.append(wrong_dir)
+            self.last_source_instruments.append(source_instrument)
+            self.last_wrong_instruments.append(wrong_instrument)
+            self.last_is_cross_instrument.append(source_instrument != wrong_instrument)
+            videos.append(torch.from_numpy(video_block[0]))
+            flows.append(torch.from_numpy(flow_block[0]))
+        video = torch.stack(videos, dim=0).to(
+            device=reference_video.device,
+            dtype=reference_video.dtype,
+        )
+        flow = torch.stack(flows, dim=0).to(
+            device=reference_flow.device,
+            dtype=reference_flow.dtype,
+        )
+        if video.shape != reference_video.shape or flow.shape != reference_flow.shape:
+            raise RuntimeError(
+                "wrong_video sample shape mismatch: "
+                f"video={tuple(video.shape)} expected={tuple(reference_video.shape)}; "
+                f"flow={tuple(flow.shape)} expected={tuple(reference_flow.shape)}"
+            )
+        return video, flow
+
+
+def blur_video_batch(video_batch, kernel_size):
+    kernel_size = int(kernel_size)
+    if kernel_size <= 1:
+        return video_batch
+    batch_size, frames, channels, height, width = video_batch.shape
+    flat = video_batch.reshape(batch_size * frames, channels, height, width)
+    blurred = F.avg_pool2d(
+        flat,
+        kernel_size=kernel_size,
+        stride=1,
+        padding=kernel_size // 2,
+    )
+    return blurred.reshape(batch_size, frames, channels, height, width)
+
+
+def frame_drop_batch(video_batch, flow_batch, stride):
+    stride = max(1, int(stride))
+    if stride <= 1:
+        return video_batch, flow_batch
+    frames = int(video_batch.size(1))
+    frame_indices = torch.arange(frames, device=video_batch.device)
+    source_indices = (frame_indices // stride) * stride
+    source_indices = torch.clamp(source_indices, max=frames - 1)
+    dropped_video = video_batch.index_select(1, source_indices)
+    dropped_flow = flow_batch.clone()
+    drop_mask = (frame_indices % stride) != 0
+    if bool(drop_mask.any()):
+        dropped_flow[:, drop_mask] = 0.0
+    return dropped_video, dropped_flow
+
+
+def temporal_shift_batch(video_batch, flow_batch, shift_frames):
+    shift_frames = int(shift_frames)
+    if shift_frames <= 0:
+        return video_batch, flow_batch
+    frames = int(video_batch.size(1))
+    shift = min(shift_frames, frames)
+    shifted_video = video_batch.clone()
+    shifted_flow = torch.zeros_like(flow_batch)
+    if shift < frames:
+        shifted_video[:, shift:] = video_batch[:, : frames - shift]
+        shifted_flow[:, shift:] = flow_batch[:, : frames - shift]
+    shifted_video[:, :shift] = video_batch[:, :1].expand(-1, shift, -1, -1, -1)
+    return shifted_video, shifted_flow
+
+
+def apply_test_video_perturbation(model, wrong_video_sampler=None):
+    mode = perturbation_mode()
+    if mode == "none":
+        return
+    if mode == "blur":
+        model.video_batch = blur_video_batch(
+            model.video_batch,
+            getattr(hparams, "video_blur_kernel", 9),
+        )
+        return
+    if mode == "flow_zero":
+        model.flow_batch = torch.zeros_like(model.flow_batch)
+        return
+    if mode == "frame_drop":
+        model.video_batch, model.flow_batch = frame_drop_batch(
+            model.video_batch,
+            model.flow_batch,
+            getattr(hparams, "video_frame_drop_stride", 2),
+        )
+        return
+    if mode == "temporal_shift":
+        model.video_batch, model.flow_batch = temporal_shift_batch(
+            model.video_batch,
+            model.flow_batch,
+            getattr(hparams, "video_temporal_shift_frames", 6),
+        )
+        return
+    if mode in {"wrong_video", "wrong_video_any", "wrong_video_cross_instrument"}:
+        if wrong_video_sampler is None:
+            raise RuntimeError("wrong_video perturbation requires a WrongVideoSampler.")
+        model.video_batch, model.flow_batch = wrong_video_sampler.load_batch(
+            model.path_batch,
+            model.video_batch,
+            model.flow_batch,
+        )
+        model.set_semantic_evidence_paths(wrong_video_sampler.last_wrong_dirs)
+        return
+    if mode == "no_video":
+        model.video_batch = torch.zeros_like(model.video_batch)
+        model.flow_batch = torch.zeros_like(model.flow_batch)
+        model.set_semantic_evidence_override(0.0)
+        return
+    raise RuntimeError(f"Unsupported video perturbation: {mode}")
+
+
+def write_table(path, rows, fieldnames=None):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    if fieldnames is None:
+        fieldnames = []
+        seen = set()
+        for row in rows:
+            for key in row.keys():
+                if key not in seen:
+                    fieldnames.append(key)
+                    seen.add(key)
+    with open(path, "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({field: row.get(field, "") for field in fieldnames})
+    return path
+
+
+def _to_flat_np(tensor):
+    return tensor.detach().cpu().numpy().reshape(-1)
+
+
+def _mean_per_sample(tensor):
+    return tensor.detach().reshape(tensor.size(0), -1).mean(dim=1).cpu().numpy()
+
+
+def collect_per_sample_rows(
+    model,
+    candidate_metrics,
+    start_index,
+    wrong_video_sampler=None,
+):
+    rows = []
+    candidate_missing = candidate_metrics["candidate_missing_l1"].detach().cpu().numpy()
+    candidate_pi = model.candidate_pi.detach().cpu().numpy()
+    top1_indices = candidate_metrics["top1_indices"].detach().cpu().numpy()
+    best_indices = np.argmin(candidate_missing, axis=1)
+    uncertainty = _to_flat_np(model.uncertainty_score)
+    evidence = _mean_per_sample(model.evidence_score)
+    heuristic_evidence = _mean_per_sample(model.heuristic_evidence_score)
+    semantic_evidence = _mean_per_sample(model.semantic_evidence_score)
+    gate = _mean_per_sample(model.gate_value)
+    sigma_scale = _mean_per_sample(model.adapter_sigma_scale)
+    pairwise = _to_flat_np(candidate_metrics["candidate_pairwise_mel_l1_per_sample"])
+    top1_error = _to_flat_np(candidate_metrics["top1_missing_l1_per_sample"])
+    best_error = _to_flat_np(candidate_metrics["best_of_k_missing_l1_per_sample"])
+    mean_error = _to_flat_np(candidate_metrics["mean_k_missing_l1_per_sample"])
+    oracle_gain = _to_flat_np(candidate_metrics["oracle_gain_per_sample"])
+    boundary_top1 = _to_flat_np(
+        candidate_metrics.get(
+            "top1_boundary_delta_error_per_sample",
+            torch.zeros_like(candidate_metrics["top1_missing_l1_per_sample"]),
+        )
+    )
+    boundary_best = _to_flat_np(
+        candidate_metrics.get(
+            "best_boundary_delta_error_per_sample",
+            torch.zeros_like(candidate_metrics["top1_missing_l1_per_sample"]),
+        )
+    )
+    boundary_mean = _to_flat_np(
+        candidate_metrics.get(
+            "mean_boundary_delta_error_per_sample",
+            torch.zeros_like(candidate_metrics["top1_missing_l1_per_sample"]),
+        )
+    )
+
+    for index, sample_path in enumerate(model.path_batch):
+        row = {
+            "sample_index": int(start_index + index),
+            "sample_path": sample_path,
+            "video_perturbation": perturbation_mode(),
+            "top1_index": int(top1_indices[index]),
+            "best_index": int(best_indices[index]),
+            "uncertainty": float(uncertainty[index]),
+            "evidence": float(evidence[index]),
+            "heuristic_evidence": float(heuristic_evidence[index]),
+            "semantic_evidence": float(semantic_evidence[index]),
+            "gate": float(gate[index]),
+            "sigma_scale": float(sigma_scale[index]),
+            "top1_missing_l1": float(top1_error[index]),
+            "best_of_k_missing_l1": float(best_error[index]),
+            "mean_k_missing_l1": float(mean_error[index]),
+            "oracle_gain": float(oracle_gain[index]),
+            "candidate_pairwise_mel_l1": float(pairwise[index]),
+            "boundary_delta_error_top1": float(boundary_top1[index]),
+            "boundary_delta_error_best": float(boundary_best[index]),
+            "boundary_delta_error_mean": float(boundary_mean[index]),
+        }
+        if wrong_video_sampler is not None and index < len(wrong_video_sampler.last_wrong_dirs):
+            row.update(
+                {
+                    "source_instrument": wrong_video_sampler.last_source_instruments[index],
+                    "wrong_video_instrument": wrong_video_sampler.last_wrong_instruments[index],
+                    "wrong_video_sample_path": wrong_video_sampler.last_wrong_dirs[index],
+                    "wrong_video_is_cross_instrument": bool(
+                        wrong_video_sampler.last_is_cross_instrument[index]
+                    ),
+                }
+            )
+        else:
+            row.update(
+                {
+                    "source_instrument": "",
+                    "wrong_video_instrument": "",
+                    "wrong_video_sample_path": "",
+                    "wrong_video_is_cross_instrument": "",
+                }
+            )
+        for candidate_index in range(candidate_missing.shape[1]):
+            row[f"candidate_{candidate_index:02d}_missing_l1"] = float(
+                candidate_missing[index, candidate_index]
+            )
+            row[f"candidate_{candidate_index:02d}_pi"] = float(
+                candidate_pi[index, candidate_index]
+            )
+        rows.append(row)
+    return rows
+
+
+def save_candidate_mel_batches(output_dir, start_index, model):
+    if output_dir is None:
+        return ""
+    num_candidates = int(model.mel_candidates.size(1))
+    for candidate_index in range(num_candidates):
+        candidate_dir = os.path.join(output_dir, f"candidate_{candidate_index:02d}")
+        save_mel_comparison_batch(
+            candidate_dir,
+            start_index,
+            model.path_batch,
+            model.mel_input_4d,
+            model.mel_candidates[:, candidate_index],
+            model.mel_target_4d,
+            model.missing_mask,
+        )
+    return output_dir
+
+
+def save_candidate_vocoder_batches(output_dir, start_index, model, max_items=None):
+    if output_dir is None:
+        return 0
+    batch_size = int(model.mel_candidates.size(0))
+    if max_items is not None:
+        batch_size = min(batch_size, max(0, int(max_items)))
+    if batch_size <= 0:
+        return 0
+    num_candidates = int(model.mel_candidates.size(1))
+    for candidate_index in range(num_candidates):
+        candidate_dir = os.path.join(output_dir, f"candidate_{candidate_index:02d}")
+        save_vocoder_batch(
+            candidate_dir,
+            start_index,
+            model.path_batch,
+            model.mel_input_4d,
+            model.mel_candidates[:, candidate_index],
+            model.missing_mask,
+            model.audio_target,
+            hparams,
+            backend=getattr(hparams, "vocoder_backend", "griffin_lim"),
+            n_iter=getattr(hparams, "vocoder_n_iter", 32),
+            max_items=batch_size,
+        )
+    return batch_size
+
+
+def evaluate(
+    model,
+    data_loader,
+    global_step=0,
+    image_dir=None,
+    vocoder_dir=None,
+    candidate_image_dir=None,
+    candidate_vocoder_dir=None,
+    per_sample_path=None,
+    risk_path=None,
+    calibration_path=None,
+    wrong_video_sampler=None,
+):
     totals = {
         "loss_total": 0.0,
         "loss_av_gen": 0.0,
@@ -380,14 +897,8 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "weighted_loss_evidence_div": 0.0,
         "weighted_loss_gate_evidence": 0.0,
         "weighted_loss_calib": 0.0,
-        "best_of_k_missing_l1": 0.0,
-        "mean_k_missing_l1": 0.0,
-        "top1_missing_l1": 0.0,
-        "candidate0_missing_l1": 0.0,
-        "random_expected_missing_l1": 0.0,
-        "oracle_gain": 0.0,
-        "uncertainty_mean": 0.0,
-        "candidate_pairwise_distance": 0.0,
+        "heuristic_evidence_mean": 0.0,
+        "semantic_evidence_mean": 0.0,
         "evidence_diversity_gap": 0.0,
         "gate_mean": 0.0,
         "gate_target_mean": 0.0,
@@ -405,16 +916,33 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "missing_psnr": 0.0,
         "ssim": 0.0,
     }
+    sample_totals = {
+        "best_of_k_missing_l1": 0.0,
+        "mean_k_missing_l1": 0.0,
+        "top1_missing_l1": 0.0,
+        "candidate0_missing_l1": 0.0,
+        "random_expected_missing_l1": 0.0,
+        "oracle_gain": 0.0,
+        "candidate_pairwise_mel_l1": 0.0,
+        "boundary_delta_error_top1": 0.0,
+        "boundary_delta_error_best": 0.0,
+        "boundary_delta_error_mean": 0.0,
+    }
     sample_count = 0
     batch_count = 0
     skipped_batches = 0
     vocoder_count = 0
+    candidate_vocoder_count = 0
     vocoder_max_samples = getattr(hparams, "vocoder_max_samples", None)
     audio_embeddings = []
     video_embeddings = []
     uncertainty_values = []
     top1_error_values = []
     best_error_values = []
+    oracle_gain_values = []
+    evidence_values = []
+    pairwise_values = []
+    per_sample_rows = []
 
     progress = tqdm(
         data_loader,
@@ -429,10 +957,21 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
             continue
         model.get_blank_space_length(0)
         model.set_inputs(data)
+        apply_test_video_perturbation(model, wrong_video_sampler=wrong_video_sampler)
         model.test(global_step=global_step)
         model.get_loss_items()
         metrics = batch_metrics(model)
+        candidate_metrics = compute_multi_candidate_metrics(
+            model.mel_candidates,
+            model.mel_completed_candidates,
+            model.mel_target_4d,
+            model.missing_mask,
+            top1_indices=model.candidate_top1_index,
+            candidate_pi=model.candidate_pi,
+            missing_span=model.missing_span,
+        )
         batch_size = metrics["num_samples"]
+        batch_start_index = sample_count
 
         totals["loss_total"] += model.loss_total_item
         totals["loss_av_gen"] += model.loss_av_gen_item
@@ -459,14 +998,8 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         totals["weighted_loss_evidence_div"] += model.weighted_loss_evidence_div_item
         totals["weighted_loss_gate_evidence"] += model.weighted_loss_gate_evidence_item
         totals["weighted_loss_calib"] += model.weighted_loss_calib_item
-        totals["best_of_k_missing_l1"] += model.best_of_k_missing_l1_item
-        totals["mean_k_missing_l1"] += model.mean_k_missing_l1_item
-        totals["top1_missing_l1"] += model.top1_missing_l1_item
-        totals["candidate0_missing_l1"] += model.candidate0_missing_l1_item
-        totals["random_expected_missing_l1"] += model.random_expected_missing_l1_item
-        totals["oracle_gain"] += model.oracle_gain_item
-        totals["uncertainty_mean"] += model.uncertainty_mean_item
-        totals["candidate_pairwise_distance"] += model.candidate_pairwise_distance_item
+        totals["heuristic_evidence_mean"] += model.heuristic_evidence_mean_item
+        totals["semantic_evidence_mean"] += model.semantic_evidence_mean_item
         totals["evidence_diversity_gap"] += model.evidence_diversity_gap_item
         totals["gate_mean"] += model.gate_mean_item
         totals["gate_target_mean"] += model.gate_target_mean_item
@@ -483,11 +1016,56 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         totals["full_psnr"] += metrics["full_psnr"]
         totals["missing_psnr"] += metrics["missing_psnr"]
         totals["ssim"] += metrics["ssim"]
+
+        batch_top1 = _to_flat_np(candidate_metrics["top1_missing_l1_per_sample"])
+        batch_best = _to_flat_np(candidate_metrics["best_of_k_missing_l1_per_sample"])
+        batch_mean = _to_flat_np(candidate_metrics["mean_k_missing_l1_per_sample"])
+        batch_candidate0 = _to_flat_np(
+            candidate_metrics["candidate0_missing_l1_per_sample"]
+        )
+        batch_random = _to_flat_np(
+            candidate_metrics["random_expected_missing_l1_per_sample"]
+        )
+        batch_oracle = _to_flat_np(candidate_metrics["oracle_gain_per_sample"])
+        batch_pairwise = _to_flat_np(
+            candidate_metrics["candidate_pairwise_mel_l1_per_sample"]
+        )
+        batch_boundary_top1 = _to_flat_np(
+            candidate_metrics["top1_boundary_delta_error_per_sample"]
+        )
+        batch_boundary_best = _to_flat_np(
+            candidate_metrics["best_boundary_delta_error_per_sample"]
+        )
+        batch_boundary_mean = _to_flat_np(
+            candidate_metrics["mean_boundary_delta_error_per_sample"]
+        )
+        sample_totals["top1_missing_l1"] += float(batch_top1.sum())
+        sample_totals["best_of_k_missing_l1"] += float(batch_best.sum())
+        sample_totals["mean_k_missing_l1"] += float(batch_mean.sum())
+        sample_totals["candidate0_missing_l1"] += float(batch_candidate0.sum())
+        sample_totals["random_expected_missing_l1"] += float(batch_random.sum())
+        sample_totals["oracle_gain"] += float(batch_oracle.sum())
+        sample_totals["candidate_pairwise_mel_l1"] += float(batch_pairwise.sum())
+        sample_totals["boundary_delta_error_top1"] += float(batch_boundary_top1.sum())
+        sample_totals["boundary_delta_error_best"] += float(batch_boundary_best.sum())
+        sample_totals["boundary_delta_error_mean"] += float(batch_boundary_mean.sum())
+
         audio_embeddings.append(util.to_np(model.mel_net_norm))
         video_embeddings.append(util.to_np(model.video_net_norm))
         uncertainty_values.append(util.to_np(model.uncertainty_score.reshape(-1)))
-        top1_error_values.append(util.to_np(model.top1_missing_l1_per_sample.reshape(-1)))
-        best_error_values.append(util.to_np(model.best_of_k_missing_l1_per_sample.reshape(-1)))
+        top1_error_values.append(batch_top1)
+        best_error_values.append(batch_best)
+        oracle_gain_values.append(batch_oracle)
+        evidence_values.append(_mean_per_sample(model.evidence_score))
+        pairwise_values.append(batch_pairwise)
+        per_sample_rows.extend(
+            collect_per_sample_rows(
+                model,
+                candidate_metrics,
+                batch_start_index,
+                wrong_video_sampler=wrong_video_sampler,
+            )
+        )
         sample_count += batch_size
         batch_count += 1
         if image_dir is not None:
@@ -521,16 +1099,35 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
                     max_items=remaining,
                 )
                 vocoder_count += len(written)
+        if candidate_image_dir is not None:
+            save_candidate_mel_batches(
+                candidate_image_dir,
+                batch_start_index,
+                model,
+            )
+        if candidate_vocoder_dir is not None:
+            remaining = None
+            if vocoder_max_samples is not None:
+                remaining = int(vocoder_max_samples) - candidate_vocoder_count
+                if remaining <= 0:
+                    remaining = 0
+            if remaining is None or remaining > 0:
+                candidate_vocoder_count += save_candidate_vocoder_batches(
+                    candidate_vocoder_dir,
+                    batch_start_index,
+                    model,
+                    max_items=remaining,
+                )
         progress.set_postfix(
             loss=f"{model.loss_total_item:.4f}",
             recon=f"{model.loss_recon_item:.4f}",
             min_k=f"{model.loss_min_k_item:.4f}",
-            top1=f"{model.top1_missing_l1_item:.4f}",
+            top1=f"{float(batch_top1.mean()):.4f}",
             mean_k=f"{model.loss_mean_k_item:.4f}",
             u=f"{model.uncertainty_mean_item:.3f}",
             gate=f"{model.gate_mean_item:.3f}",
             gate_t=f"{model.gate_target_mean_item:.3f}",
-            pair=f"{model.candidate_pairwise_distance_item:.4f}",
+            pair=f"{float(batch_pairwise.mean()):.4f}",
             sync=f"{model.loss_sync_item:.4f}",
             probe=f"{model.loss_probe_gen_item:.4f}",
             g_gan=f"{model.loss_G_GAN_item:.4f}",
@@ -550,6 +1147,60 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         top1_error_values,
         best_error_values,
     )
+    all_uncertainty = np.concatenate(uncertainty_values, axis=0)
+    all_top1 = np.concatenate(top1_error_values, axis=0)
+    all_best = np.concatenate(best_error_values, axis=0)
+    all_oracle_gain = np.concatenate(oracle_gain_values, axis=0)
+    all_evidence = np.concatenate(evidence_values, axis=0)
+    all_pairwise = np.concatenate(pairwise_values, axis=0)
+    risk_rows = compute_risk_coverage_curve(
+        all_uncertainty,
+        all_top1,
+        num_points=20,
+    )
+    calibration_rows = compute_calibration_bins(
+        all_uncertainty,
+        all_top1,
+        best_error=all_best,
+        oracle_gain=all_oracle_gain,
+        evidence=all_evidence,
+        pairwise=all_pairwise,
+        num_bins=getattr(hparams, "calibration_bins", 10),
+    )
+    if per_sample_path is not None:
+        write_table(per_sample_path, per_sample_rows)
+    if risk_path is not None:
+        write_table(
+            risk_path,
+            risk_rows,
+            fieldnames=[
+                "coverage",
+                "retained_count",
+                "uncertainty_threshold",
+                "mean_top1_error",
+            ],
+        )
+    if calibration_path is not None:
+        write_table(
+            calibration_path,
+            calibration_rows,
+            fieldnames=[
+                "bin_index",
+                "bin_low",
+                "bin_high",
+                "count",
+                "avg_uncertainty",
+                "avg_top1_error",
+                "avg_best_error",
+                "avg_oracle_gain",
+                "avg_evidence",
+                "avg_pairwise",
+            ],
+        )
+
+    def sample_average(name):
+        return sample_totals[name] / sample_count
+
     return {
         "loss_total": totals["loss_total"] / batch_count,
         "loss_av_gen": totals["loss_av_gen"] / batch_count,
@@ -576,15 +1227,13 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "weighted_loss_evidence_div": totals["weighted_loss_evidence_div"] / batch_count,
         "weighted_loss_gate_evidence": totals["weighted_loss_gate_evidence"] / batch_count,
         "weighted_loss_calib": totals["weighted_loss_calib"] / batch_count,
-        "best_of_k_missing_l1": totals["best_of_k_missing_l1"] / batch_count,
-        "mean_k_missing_l1": totals["mean_k_missing_l1"] / batch_count,
-        "top1_missing_l1": totals["top1_missing_l1"] / batch_count,
-        "candidate0_missing_l1": totals["candidate0_missing_l1"] / batch_count,
-        "random_expected_missing_l1": (
-            totals["random_expected_missing_l1"] / batch_count
-        ),
-        "oracle_gain": totals["oracle_gain"] / batch_count,
-        "uncertainty_mean": totals["uncertainty_mean"] / batch_count,
+        "best_of_k_missing_l1": sample_average("best_of_k_missing_l1"),
+        "mean_k_missing_l1": sample_average("mean_k_missing_l1"),
+        "top1_missing_l1": sample_average("top1_missing_l1"),
+        "candidate0_missing_l1": sample_average("candidate0_missing_l1"),
+        "random_expected_missing_l1": sample_average("random_expected_missing_l1"),
+        "oracle_gain": sample_average("oracle_gain"),
+        "uncertainty_mean": float(all_uncertainty.mean()),
         "uncertainty_error_corr": uncertainty_corrs["uncertainty_error_corr"],
         "uncertainty_error_spearman": uncertainty_corrs["uncertainty_error_spearman"],
         "uncertainty_best_error_corr": uncertainty_corrs["uncertainty_best_error_corr"],
@@ -592,7 +1241,16 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
             "uncertainty_best_error_spearman"
         ],
         "uncertainty_corr_count": uncertainty_corrs["uncertainty_corr_count"],
-        "candidate_pairwise_distance": totals["candidate_pairwise_distance"] / batch_count,
+        "candidate_pairwise_distance": sample_average("candidate_pairwise_mel_l1"),
+        "candidate_pairwise_mel_l1": sample_average("candidate_pairwise_mel_l1"),
+        "boundary_delta_error_top1": sample_average("boundary_delta_error_top1"),
+        "boundary_delta_error_best": sample_average("boundary_delta_error_best"),
+        "boundary_delta_error_mean": sample_average("boundary_delta_error_mean"),
+        "evidence_mean": float(all_evidence.mean()),
+        "evidence_min": float(all_evidence.min()),
+        "evidence_max": float(all_evidence.max()),
+        "heuristic_evidence_mean": totals["heuristic_evidence_mean"] / batch_count,
+        "semantic_evidence_mean": totals["semantic_evidence_mean"] / batch_count,
         "evidence_diversity_gap": totals["evidence_diversity_gap"] / batch_count,
         "gate_mean": totals["gate_mean"] / batch_count,
         "gate_target_mean": totals["gate_target_mean"] / batch_count,
@@ -615,8 +1273,27 @@ def evaluate(model, data_loader, global_step=0, image_dir=None, vocoder_dir=None
         "retrieval_audio_to_video": audio_to_video,
         "retrieval_video_to_audio": video_to_audio,
         "skipped_batches": skipped_batches,
+        "wrong_video_effective_mode": wrong_video_effective_mode(perturbation_mode()),
+        "wrong_video_cross_instrument_available": bool(
+            wrong_video_sampler.cross_instrument_available
+            if wrong_video_sampler is not None
+            else False
+        ),
+        "wrong_video_num_instruments": int(
+            len(wrong_video_sampler.instruments)
+            if wrong_video_sampler is not None
+            else 0
+        ),
         "vocoder_output_dir": "" if vocoder_dir is None else vocoder_dir,
         "vocoder_num_samples": vocoder_count,
+        "candidate_image_dir": "" if candidate_image_dir is None else candidate_image_dir,
+        "candidate_vocoder_dir": (
+            "" if candidate_vocoder_dir is None else candidate_vocoder_dir
+        ),
+        "candidate_vocoder_num_samples": candidate_vocoder_count,
+        "per_sample_metrics_path": "" if per_sample_path is None else per_sample_path,
+        "risk_coverage_path": "" if risk_path is None else risk_path,
+        "calibration_bins_path": "" if calibration_path is None else calibration_path,
     }
 
 
@@ -655,7 +1332,17 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "enable_candidate_scorer": bool(
             getattr(hparams, "enable_candidate_scorer", False)
         ),
+        "train_candidate_heads_only": bool(
+            getattr(hparams, "train_candidate_heads_only", False)
+        ),
         "evidence_source": getattr(hparams, "evidence_source", "none"),
+        "semantic_evidence_path": getattr(hparams, "semantic_evidence_path", ""),
+        "semantic_evidence_weight": float(
+            getattr(hparams, "semantic_evidence_weight", 0.35)
+        ),
+        "semantic_missing_score": float(
+            getattr(hparams, "semantic_missing_score", 0.0)
+        ),
         "enable_visual_evidence_aug": bool(
             getattr(hparams, "enable_visual_evidence_aug", False)
         ),
@@ -674,6 +1361,21 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "calib_error_tau": float(getattr(hparams, "calib_error_tau", 0.1)),
         "save_candidates": bool(getattr(hparams, "save_candidates", False)),
         "video_perturbation": getattr(hparams, "video_perturbation", "none"),
+        "wrong_video_effective_mode": results.get("wrong_video_effective_mode", ""),
+        "wrong_video_cross_instrument_available": bool(
+            results.get("wrong_video_cross_instrument_available", False)
+        ),
+        "wrong_video_num_instruments": int(
+            results.get("wrong_video_num_instruments", 0)
+        ),
+        "video_blur_kernel": int(getattr(hparams, "video_blur_kernel", 9)),
+        "video_frame_drop_stride": int(
+            getattr(hparams, "video_frame_drop_stride", 2)
+        ),
+        "video_temporal_shift_frames": int(
+            getattr(hparams, "video_temporal_shift_frames", 6)
+        ),
+        "calibration_bins": int(getattr(hparams, "calibration_bins", 10)),
         "num_samples": int(results["num_samples"]),
         "loss_total": float(results["loss_total"]),
         "loss_av_gen": float(results["loss_av_gen"]),
@@ -715,6 +1417,15 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         ),
         "uncertainty_corr_count": int(results["uncertainty_corr_count"]),
         "candidate_pairwise_distance": float(results["candidate_pairwise_distance"]),
+        "candidate_pairwise_mel_l1": float(results["candidate_pairwise_mel_l1"]),
+        "boundary_delta_error_top1": float(results["boundary_delta_error_top1"]),
+        "boundary_delta_error_best": float(results["boundary_delta_error_best"]),
+        "boundary_delta_error_mean": float(results["boundary_delta_error_mean"]),
+        "evidence_mean": float(results["evidence_mean"]),
+        "evidence_min": float(results["evidence_min"]),
+        "evidence_max": float(results["evidence_max"]),
+        "heuristic_evidence_mean": float(results["heuristic_evidence_mean"]),
+        "semantic_evidence_mean": float(results["semantic_evidence_mean"]),
         "evidence_diversity_gap": float(results["evidence_diversity_gap"]),
         "gate_mean": float(results["gate_mean"]),
         "gate_target_mean": float(results["gate_target_mean"]),
@@ -763,11 +1474,22 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "vocoder_n_iter": int(getattr(hparams, "vocoder_n_iter", 32)),
         "vocoder_output_dir": results.get("vocoder_output_dir", ""),
         "vocoder_num_samples": int(results.get("vocoder_num_samples", 0)),
+        "candidate_image_dir": results.get("candidate_image_dir", ""),
+        "candidate_vocoder_dir": results.get("candidate_vocoder_dir", ""),
+        "candidate_vocoder_num_samples": int(
+            results.get("candidate_vocoder_num_samples", 0)
+        ),
+        "per_sample_metrics_path": results.get("per_sample_metrics_path", ""),
+        "risk_coverage_path": results.get("risk_coverage_path", ""),
+        "calibration_bins_path": results.get("calibration_bins_path", ""),
     }
 
 
 def coerce_csv_record(row):
     record = {}
+    bool_fields = {
+        "wrong_video_cross_instrument_available",
+    }
     int_fields = {
         "checkpoint_step",
         "global_step",
@@ -778,6 +1500,12 @@ def coerce_csv_record(row):
         "uncertainty_corr_count",
         "vocoder_n_iter",
         "vocoder_num_samples",
+        "candidate_vocoder_num_samples",
+        "wrong_video_num_instruments",
+        "video_blur_kernel",
+        "video_frame_drop_stride",
+        "video_temporal_shift_frames",
+        "calibration_bins",
     }
     float_fields = {
         "loss_total",
@@ -817,6 +1545,15 @@ def coerce_csv_record(row):
         "uncertainty_best_error_corr",
         "uncertainty_best_error_spearman",
         "candidate_pairwise_distance",
+        "candidate_pairwise_mel_l1",
+        "boundary_delta_error_top1",
+        "boundary_delta_error_best",
+        "boundary_delta_error_mean",
+        "evidence_mean",
+        "evidence_min",
+        "evidence_max",
+        "heuristic_evidence_mean",
+        "semantic_evidence_mean",
         "evidence_diversity_gap",
         "gate_mean",
         "gate_target_mean",
@@ -839,6 +1576,8 @@ def coerce_csv_record(row):
         "evidence_gate_high",
         "evidence_sigma_scale_min",
         "evidence_sigma_scale_max",
+        "semantic_evidence_weight",
+        "semantic_missing_score",
         "calib_error_tau",
         "visual_evidence_aug_prob",
         "sigma_min",
@@ -865,7 +1604,9 @@ def coerce_csv_record(row):
     }
     for field in RESULT_FIELDS:
         value = row.get(field, "")
-        if field in int_fields and value != "":
+        if field in bool_fields and value != "":
+            record[field] = str(value).lower() in {"1", "true", "yes"}
+        elif field in int_fields and value != "":
             record[field] = int(value)
         elif field in float_fields and value != "":
             record[field] = float(value)
@@ -877,13 +1618,17 @@ def coerce_csv_record(row):
 def write_result_files(record, results_dir, name):
     os.makedirs(results_dir, exist_ok=True)
     step_text = format_step(record["checkpoint_step"])
-    json_path = os.path.join(results_dir, f"{name}_step{step_text}_test.json")
+    mode = safe_token(record.get("video_perturbation", "none"))
+    json_path = os.path.join(
+        results_dir,
+        f"{name}_step{step_text}_perturb-{mode}_test.json",
+    )
     csv_path = os.path.join(results_dir, f"{name}_test_summary.csv")
     with open(json_path, "w", encoding="utf-8") as handle:
         json.dump(record, handle, ensure_ascii=True, indent=2)
         handle.write("\n")
 
-    records_by_step = {}
+    records_by_key = {}
     if os.path.exists(csv_path):
         with open(csv_path, "r", encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
@@ -891,9 +1636,19 @@ def write_result_files(record, results_dir, name):
                 if not row.get("checkpoint_step"):
                     continue
                 old_record = coerce_csv_record(row)
-                records_by_step[int(old_record["checkpoint_step"])] = old_record
-    records_by_step[int(record["checkpoint_step"])] = record
-    sorted_records = [records_by_step[step] for step in sorted(records_by_step)]
+                old_key = (
+                    int(old_record["checkpoint_step"]),
+                    str(old_record.get("video_perturbation", "none") or "none"),
+                    int(old_record.get("test_num_candidates", 1) or 1),
+                )
+                records_by_key[old_key] = old_record
+    record_key = (
+        int(record["checkpoint_step"]),
+        str(record.get("video_perturbation", "none") or "none"),
+        int(record.get("test_num_candidates", 1) or 1),
+    )
+    records_by_key[record_key] = record
+    sorted_records = [records_by_key[key] for key in sorted(records_by_key)]
     with open(csv_path, "w", encoding="utf-8", newline="") as handle:
         writer = csv.DictWriter(handle, fieldnames=RESULT_FIELDS)
         writer.writeheader()
@@ -925,6 +1680,12 @@ def main():
     if checkpoint_step_value < 0:
         checkpoint_step_value = global_step
     image_dir = mel_image_output_dir(hparams.results_dir, checkpoint_step_value)
+    candidate_image_dir = None
+    if getattr(hparams, "save_candidates", False):
+        candidate_image_dir = candidate_image_output_dir(
+            hparams.results_dir,
+            checkpoint_step_value,
+        )
     vocoder_dir = None
     if getattr(hparams, "use_vocoder", False):
         vocoder_dir = hparams.vocoder_output_dir
@@ -934,12 +1695,43 @@ def main():
                 "wav",
                 f"step{format_step(checkpoint_step_value)}",
             )
+    candidate_vocoder_dir = None
+    if getattr(hparams, "save_candidates", False) and getattr(hparams, "use_vocoder", False):
+        candidate_vocoder_dir = candidate_vocoder_output_dir(
+            hparams.results_dir,
+            checkpoint_step_value,
+        )
+    wrong_video_sampler = None
+    if perturbation_mode() in {
+        "wrong_video",
+        "wrong_video_any",
+        "wrong_video_cross_instrument",
+    }:
+        wrong_video_sampler = WrongVideoSampler(hparams)
+    sample_metrics_path = per_sample_metrics_path(
+        hparams.results_dir,
+        checkpoint_step_value,
+    )
+    risk_path_value = risk_coverage_path(
+        hparams.results_dir,
+        checkpoint_step_value,
+    )
+    calibration_path_value = calibration_bins_path(
+        hparams.results_dir,
+        checkpoint_step_value,
+    )
     results = evaluate(
         model,
         data_loaders["test"],
         global_step=checkpoint_step_value,
         image_dir=image_dir,
         vocoder_dir=vocoder_dir,
+        candidate_image_dir=candidate_image_dir,
+        candidate_vocoder_dir=candidate_vocoder_dir,
+        per_sample_path=sample_metrics_path,
+        risk_path=risk_path_value,
+        calibration_path=calibration_path_value,
+        wrong_video_sampler=wrong_video_sampler,
     )
     result_record = build_result_record(
         checkpoint_path,
@@ -981,7 +1773,9 @@ def main():
         f"uncertainty={results['uncertainty_mean']:.6f} "
         f"u_top1_corr={results['uncertainty_error_corr']:.6f} "
         f"u_top1_spearman={results['uncertainty_error_spearman']:.6f} "
-        f"pairwise={results['candidate_pairwise_distance']:.6f} "
+        f"pairwise={results['candidate_pairwise_mel_l1']:.6f} "
+        f"boundary_top1={results['boundary_delta_error_top1']:.6f} "
+        f"evidence={results['evidence_mean']:.6f} "
         f"div_gap={results['evidence_diversity_gap']:.6f} "
         f"gate_mean={results['gate_mean']:.6f} "
         f"gate_target={results['gate_target_mean']:.6f} "
@@ -1017,11 +1811,22 @@ def main():
     print(f"[VIAI-AV test] wrote json: {json_path}")
     print(f"[VIAI-AV test] wrote summary csv: {csv_path}")
     print(f"[VIAI-AV test] wrote mel images: {image_dir}")
+    print(f"[VIAI-AV test] wrote per-sample metrics: {results['per_sample_metrics_path']}")
+    print(f"[VIAI-AV test] wrote risk-coverage: {results['risk_coverage_path']}")
+    print(f"[VIAI-AV test] wrote calibration bins: {results['calibration_bins_path']}")
+    if getattr(hparams, "save_candidates", False):
+        print(f"[VIAI-AV test] wrote candidate mel images: {results['candidate_image_dir']}")
     if getattr(hparams, "use_vocoder", False):
         print(
             f"[VIAI-AV test] wrote vocoder wavs: {results['vocoder_output_dir']} "
             f"({results['vocoder_num_samples']} samples)"
         )
+        if getattr(hparams, "save_candidates", False):
+            print(
+                "[VIAI-AV test] wrote candidate vocoder wavs: "
+                f"{results['candidate_vocoder_dir']} "
+                f"({results['candidate_vocoder_num_samples']} samples)"
+            )
 
 
 if __name__ == "__main__":

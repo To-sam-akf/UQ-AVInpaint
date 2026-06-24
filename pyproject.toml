@@ -22,3 +22,6 @@ dependencies = [
 local-cuda = [
     "torch",
 ]
+semantic = [
+    "open_clip_torch",
+]

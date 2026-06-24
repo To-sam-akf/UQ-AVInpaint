@@ -172,10 +172,19 @@ class BaseOptions(object):
         self.parser.add_argument("--freeze_gate_evidence_backbone", action="store_true")
         self.parser.add_argument("--enable_evidence_scaled_sigma", action="store_true")
         self.parser.add_argument("--enable_candidate_scorer", action="store_true")
+        self.parser.add_argument("--train_candidate_heads_only", action="store_true")
         self.parser.add_argument("--calib_error_tau", type=float, default=0.1)
         self.parser.add_argument("--evidence_sigma_scale_min", type=float, default=0.5)
         self.parser.add_argument("--evidence_sigma_scale_max", type=float, default=2.0)
-        self.parser.add_argument("--evidence_source", type=str, default="none")
+        self.parser.add_argument(
+            "--evidence_source",
+            type=str,
+            default="none",
+            choices=["none", "heuristic", "semantic", "fused"],
+        )
+        self.parser.add_argument("--semantic_evidence_path", type=str, default="")
+        self.parser.add_argument("--semantic_evidence_weight", type=float, default=0.35)
+        self.parser.add_argument("--semantic_missing_score", type=float, default=0.0)
         self.parser.add_argument("--evidence_diversity_d_min", type=float, default=0.02)
         self.parser.add_argument("--evidence_diversity_alpha", type=float, default=0.08)
         self.parser.add_argument("--evidence_gate_low", type=float, default=0.24)
@@ -191,7 +200,26 @@ class BaseOptions(object):
         self.parser.add_argument("--sigma_max", type=float, default=1.0)
         self.parser.add_argument("--test_num_candidates", type=int, default=None)
         self.parser.add_argument("--save_candidates", action="store_true")
-        self.parser.add_argument("--video_perturbation", type=str, default="none")
+        self.parser.add_argument(
+            "--video_perturbation",
+            type=str,
+            default="none",
+            choices=[
+                "none",
+                "blur",
+                "flow_zero",
+                "frame_drop",
+                "temporal_shift",
+                "wrong_video",
+                "wrong_video_any",
+                "wrong_video_cross_instrument",
+                "no_video",
+            ],
+        )
+        self.parser.add_argument("--video_blur_kernel", type=int, default=9)
+        self.parser.add_argument("--video_frame_drop_stride", type=int, default=2)
+        self.parser.add_argument("--video_temporal_shift_frames", type=int, default=6)
+        self.parser.add_argument("--calibration_bins", type=int, default=10)
 
         # Missing-region setup (4s inputs, 0.4s~1.0s gaps)
         self.parser.add_argument("--max_time_sec", type=float, default=None)
@@ -323,6 +351,13 @@ class BaseOptions(object):
             self.parser.error("--lambda_calib must be >= 0.")
         if opt.lambda_calib > 0 and not opt.enable_candidate_scorer:
             self.parser.error("--lambda_calib > 0 requires --enable_candidate_scorer.")
+        if opt.train_candidate_heads_only:
+            if not opt.enable_candidate_scorer:
+                self.parser.error(
+                    "--train_candidate_heads_only requires --enable_candidate_scorer."
+                )
+            if opt.lambda_calib <= 0:
+                self.parser.error("--train_candidate_heads_only requires --lambda_calib > 0.")
         if opt.enable_candidate_scorer and not (
             opt.enable_ec_viai_av and opt.stochastic_adapter
         ):
@@ -340,6 +375,10 @@ class BaseOptions(object):
             self.parser.error(
                 "--evidence_sigma_scale_max must be >= --evidence_sigma_scale_min."
             )
+        if opt.semantic_evidence_weight < 0 or opt.semantic_evidence_weight > 1:
+            self.parser.error("--semantic_evidence_weight must be in [0, 1].")
+        if opt.semantic_missing_score < 0 or opt.semantic_missing_score > 1:
+            self.parser.error("--semantic_missing_score must be in [0, 1].")
         if opt.visual_evidence_aug_prob < 0 or opt.visual_evidence_aug_prob > 1:
             self.parser.error("--visual_evidence_aug_prob must be in [0, 1].")
         valid_aug_modes = {
@@ -362,6 +401,16 @@ class BaseOptions(object):
                 "--visual_evidence_aug_modes contains unsupported modes: "
                 + ", ".join(invalid_aug_modes)
             )
+        if opt.video_blur_kernel < 1:
+            self.parser.error("--video_blur_kernel must be >= 1.")
+        if opt.video_blur_kernel % 2 == 0:
+            self.parser.error("--video_blur_kernel must be odd.")
+        if opt.video_frame_drop_stride < 1:
+            self.parser.error("--video_frame_drop_stride must be >= 1.")
+        if opt.video_temporal_shift_frames < 0:
+            self.parser.error("--video_temporal_shift_frames must be >= 0.")
+        if opt.calibration_bins < 1:
+            self.parser.error("--calibration_bins must be >= 1.")
         if opt.stochastic_adapter and opt.deterministic_adapter:
             self.parser.error(
                 "--stochastic_adapter and --deterministic_adapter cannot both be enabled."

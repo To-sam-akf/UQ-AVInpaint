@@ -2,6 +2,7 @@ import os
 import sys
 from types import SimpleNamespace
 
+import pytest
 import torch
 
 
@@ -218,7 +219,104 @@ def test_freeze_gate_evidence_backbone_excludes_encoder_params_from_optimizer():
     assert not (optimizer_param_ids & video_encoder_param_ids)
     assert optimizer_param_ids & decoder_param_ids
     assert all(not parameter.requires_grad for parameter in model.Mel_Encoder.parameters())
-    assert all(not parameter.requires_grad for parameter in model.VideoEncoder.parameters())
+
+
+def test_candidate_heads_only_requires_candidate_scorer():
+    with pytest.raises(SystemExit):
+        Options_inpainting.Inpainting_Config(
+            force_reload=True,
+            args=[
+                "--enable_ec_viai_av",
+                "--stochastic_adapter",
+                "--train_candidate_heads_only",
+                "--lambda_calib",
+                "0.1",
+            ],
+        )
+
+
+def test_candidate_heads_only_requires_calibration_weight():
+    with pytest.raises(SystemExit):
+        Options_inpainting.Inpainting_Config(
+            force_reload=True,
+            args=[
+                "--enable_ec_viai_av",
+                "--stochastic_adapter",
+                "--enable_candidate_scorer",
+                "--train_candidate_heads_only",
+            ],
+        )
+
+
+def test_candidate_heads_only_optimizer_contains_only_scorer_and_uncertainty_head():
+    hparams = Options_inpainting.Inpainting_Config(
+        force_reload=True,
+        args=[
+            "--use_gan",
+            "--enable_ec_viai_av",
+            "--stochastic_adapter",
+            "--enable_evidence_gate",
+            "--enable_evidence_scaled_sigma",
+            "--enable_candidate_scorer",
+            "--train_candidate_heads_only",
+            "--lambda_calib",
+            "0.1",
+            "--num_candidates",
+            "2",
+            "--test_num_candidates",
+            "2",
+        ],
+    )
+    model = VIAIAVModel(hparams, device=torch.device("cpu"))
+
+    optimizer_param_ids = {
+        id(parameter)
+        for group in model.optimizer_G.param_groups
+        for parameter in group["params"]
+    }
+    scorer_param_ids = {id(parameter) for parameter in model.CandidateScorer.parameters()}
+    uncertainty_param_ids = {
+        id(parameter) for parameter in model.UncertaintyHead.parameters()
+    }
+    heads_param_ids = scorer_param_ids | uncertainty_param_ids
+
+    frozen_modules = [
+        model.Mel_Encoder,
+        model.VideoEncoder,
+        model.Mel_Decoder,
+        model.EvidenceEstimator,
+        model.BottleneckAdapter,
+        model.EvidenceFusionGate,
+        model.netD,
+    ]
+    frozen_param_ids = {
+        id(parameter)
+        for module in frozen_modules
+        for parameter in module.parameters()
+    }
+
+    assert model.train_candidate_heads_only
+    assert model.optimizer_D is None
+    assert optimizer_param_ids == heads_param_ids
+    assert not (optimizer_param_ids & frozen_param_ids)
+    assert all(parameter.requires_grad for parameter in model.CandidateScorer.parameters())
+    assert all(parameter.requires_grad for parameter in model.UncertaintyHead.parameters())
+    assert all(
+        not parameter.requires_grad
+        for module in frozen_modules
+        for parameter in module.parameters()
+    )
+
+    model._set_generator_train_modes()
+    assert not model.Mel_Encoder.training
+    assert not model.VideoEncoder.training
+    assert not model.Mel_Decoder.training
+    assert not model.EvidenceEstimator.training
+    assert not model.BottleneckAdapter.training
+    assert not model.EvidenceFusionGate.training
+    assert not model.netD.training
+    assert model.CandidateScorer.training
+    assert model.UncertaintyHead.training
 
 
 def test_frozen_backbone_train_modes_keep_encoders_eval():
