@@ -28,10 +28,12 @@ def test_semantic_evidence_lookup_matches_trailing_start_index(tmp_path):
         "instrument": "cello",
         "semantic_score": 0.73,
         "target_prob": 0.73,
+        "probs_by_instrument": {"cello": 0.73, "flute": 0.19},
         "top1_instrument": "cello",
         "top1_prob": 0.73,
         "target_rank": 1,
         "frame_consistency": 1.0,
+        "frame_top1_instruments": ["cello"],
         "num_frames": 8,
     }
     with evidence_path.open("w", encoding="utf-8") as handle:
@@ -44,9 +46,37 @@ def test_semantic_evidence_lookup_matches_trailing_start_index(tmp_path):
     )
 
     assert table.lookup_score(str(sample_dir)) == 0.73
+    assert table.lookup_score(str(sample_dir), target_instrument="flute") == 0.19
+    assert table.lookup_score(str(sample_dir), target_instrument="missing") == 0.11
     assert table.lookup_score(str(sample_dir / "37")) == 0.73
     assert table.lookup_score(str(data_root / "processed" / "flute" / "x")) == 0.11
     assert infer_instrument_from_sample_dir(str(sample_dir / "37")) == "cello"
+
+
+def test_semantic_evidence_lookup_keeps_legacy_jsonl_compatible(tmp_path):
+    data_root = tmp_path / "data"
+    sample_dir = data_root / "processed" / "cello" / "video" / "clip_000000"
+    evidence_path = tmp_path / "legacy.jsonl"
+    record = {
+        "sample_dir": "processed/cello/video/clip_000000",
+        "instrument": "cello",
+        "semantic_score": 0.62,
+    }
+    with evidence_path.open("w", encoding="utf-8") as handle:
+        handle.write(json.dumps(record) + "\n")
+
+    table = SemanticEvidenceTable(
+        str(evidence_path),
+        data_root=str(data_root),
+        missing_score=0.11,
+    )
+
+    assert table.lookup_score(str(sample_dir)) == 0.62
+    assert table.lookup_score(str(sample_dir), target_instrument="flute") == 0.62
+    assert table.lookup_scores(
+        [str(sample_dir), str(sample_dir / "37")],
+        target_instruments=["cello", "flute"],
+    ) == [0.62, 0.62]
 
 
 def test_combine_evidence_sources_preserves_default_heuristic_behavior():
@@ -77,10 +107,14 @@ class _FakeModel:
         self.flow_batch = torch.ones(1, 2, 2, 4, 4)
         self.path_batch = ["/data/processed/cello/a/clip_000000/12"]
         self.semantic_evidence_paths = []
+        self.semantic_evidence_target_instruments = []
         self.semantic_evidence_override = None
 
-    def set_semantic_evidence_paths(self, paths):
+    def set_semantic_evidence_paths(self, paths, target_instruments=None):
         self.semantic_evidence_paths = list(paths)
+        self.semantic_evidence_target_instruments = (
+            list(target_instruments) if target_instruments is not None else []
+        )
         self.semantic_evidence_override = None
 
     def set_semantic_evidence_override(self, value):
@@ -90,6 +124,7 @@ class _FakeModel:
 class _FakeWrongVideoSampler:
     def __init__(self):
         self.last_wrong_dirs = ["/data/processed/flute/b/clip_000000"]
+        self.last_source_instruments = ["cello"]
 
     def load_batch(self, paths, reference_video, reference_flow):
         return torch.zeros_like(reference_video), torch.zeros_like(reference_flow)
@@ -102,6 +137,7 @@ def test_wrong_and_no_video_perturbations_override_semantic_lookup():
         hparams.video_perturbation = "wrong_video_cross_instrument"
         apply_test_video_perturbation(model, wrong_video_sampler=_FakeWrongVideoSampler())
         assert model.semantic_evidence_paths == ["/data/processed/flute/b/clip_000000"]
+        assert model.semantic_evidence_target_instruments == ["cello"]
         assert model.semantic_evidence_override is None
 
         model = _FakeModel()

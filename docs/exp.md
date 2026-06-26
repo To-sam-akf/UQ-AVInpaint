@@ -1,13 +1,13 @@
 ## 第3步：实现Evidentce Estimator
 
 ### 实验现象
-当前 evidence 更像“视觉运动证据强弱”，不是完整的“音视频匹配可信度”。
+当前 evidence 更像"视觉运动证据强弱"，不是完整的"音视频匹配可信度"。
 
 本阶段主要验证 `VisualEvidenceEstimator` 是否能够稳定量化视频证据强弱，而不是验证它是否已经具备完整的音视频错配判别能力。实验采用 paired perturbation protocol：对同一条 anchor 音频和原始视频，构造不同证据强度的视频条件，包括 `original`、逐级削弱 optical flow 的 `flow_75 / flow_50 / flow_25 / flow_zero`、静态 flow、静态视频加 zero flow、跨乐器 wrong video，以及辅助观察用的 temporal shift。
 
-实验结果显示，evidence 对 optical flow 强度非常敏感。当 flow 从原始值逐步衰减到 75%、50%、25% 和 0 时，`evidence_score` 的均值基本单调下降，而且在 paired sample 级别也大多成立。这说明当前 evidence estimator 确实捕捉到了“视频运动证据强弱”这一核心信号。
+实验结果显示，evidence 对 optical flow 强度非常敏感。当 flow 从原始值逐步衰减到 75%、50%、25% 和 0 时，`evidence_score` 的均值基本单调下降，而且在 paired sample 级别也大多成立。这说明当前 evidence estimator 确实捕捉到了"视频运动证据强弱"这一核心信号。
 
-同时，`cross_instrument_wrong_video` 的 evidence 均值低于 original，但下降不如 flow_zero 稳定。这符合当前模块定位：第3步的 estimator 是一个轻量、可解释的视觉证据强度分数，而不是一个强音视频匹配分类器。跨乐器 wrong video 仍可能包含明显演奏动作和有效 optical flow，因此不一定在每个样本上都被打成低 evidence。同时当前 evidence estimator 没有真正做“语义级乐器识别”或“细粒度动作-声音同步识别”，它只是用：
+同时，`cross_instrument_wrong_video` 的 evidence 均值低于 original，但下降不如 flow_zero 稳定。这符合当前模块定位：第3步的 estimator 是一个轻量、可解释的视觉证据强度分数，而不是一个强音视频匹配分类器。跨乐器 wrong video 仍可能包含明显演奏动作和有效 optical flow，因此不一定在每个样本上都被打成低 evidence。同时当前 evidence estimator 没有真正做"语义级乐器识别"或"细粒度动作-声音同步识别"，它只是用：
 flow 强弱
 flow 时间变化
 audio/video embedding L2 距离
@@ -55,7 +55,7 @@ original_gt_temporal_shift_aux                mean_delta=0.003023 hit_rate=0.590
 
 第3步可以认为验证通过。当前 `VisualEvidenceEstimator` 能稳定量化视频证据强弱，特别是对 optical flow magnitude、temporal variance 和静态/无运动视频条件具有清晰响应。它不会改变 baseline 输出，也不会替代后续 gate、candidate scorer 或 uncertainty head，而是为这些模块提供一个轻量、可解释、可记录的 evidence input。
 
-本阶段的结论应表述为：evidence estimator 能稳定衡量“视频中是否存在可用视觉运动证据”，但不能单独保证“视频一定与音频严格匹配”。跨乐器 wrong video 和 temporal shift 的结果说明，音视频匹配可信度仍需要后续 Evidence-Aware Fusion Gate、Candidate Scorer 和 calibration loss 共同建模。
+本阶段的结论应表述为：evidence estimator 能稳定衡量"视频中是否存在可用视觉运动证据"，但不能单独保证"视频一定与音频严格匹配"。跨乐器 wrong video 和 temporal shift 的结果说明，音视频匹配可信度仍需要后续 Evidence-Aware Fusion Gate、Candidate Scorer 和 calibration loss 共同建模。
 
 因此，第3步为论文主线提供了基础支撑：模型可以先获得一个可解释的视觉证据分数，在视觉证据弱时减少对视频的依赖，并在后续多候选和不确定性模块中允许更高的不确定性。
 
@@ -187,7 +187,7 @@ mean_k_missing_l1    = 0.150553
 (0.107352 - 0.099246) / 0.107352 ≈ 7.5%
 ```
 
-同时，`mean_k_missing_l1` 明显高于 best-of-K，说明候选之间存在差异，其中一部分候选质量仍然较弱。这符合第6步的阶段预期：当前还没有 candidate scorer，模型只能证明“候选池里有更好的 oracle candidate”，还不能自己选择最优候选。
+同时，`mean_k_missing_l1` 明显高于 best-of-K，说明候选之间存在差异，其中一部分候选质量仍然较弱。这符合第6步的阶段预期：当前还没有 candidate scorer，模型只能证明"候选池里有更好的 oracle candidate"，还不能自己选择最优候选。
 
 `loss_multi_candidate` 的数值与权重组合一致：
 
@@ -199,27 +199,3 @@ mean_k_missing_l1    = 0.150553
 
 Mel 图像整体可接受。个别样本的 `raw_prediction` 中仍可见竖条或平滑伪影，但 `completed` 经过 mask compose 后保留了已知区域，因此最终图像大部分没有明显破坏。与 ground truth 相比，缺失区域的高频纹理仍偏平滑，说明当前候选生成还不是最终形态，但边界没有出现严重断裂，整体听感风险可控。
 
-### 总结
-
-第6步可以认为验证通过。
-
-本阶段达成了三个核心目标：
-
-- `L_minK` 生效：K 个候选中至少有一个候选能比 candidate 0 更贴近真实缺失片段。
-- `L_meanK` 起到基本约束：平均候选质量没有完全崩坏，但仍明显弱于 oracle best candidate。
-- `L_boundary` 生效：训练曲线中 boundary loss 后半段下降，mel 图中的 completed 边界没有明显灾难性断裂。
-
-本阶段也暴露了两个后续问题：
-
-- 候选池仍需要 scorer。当前最终输出仍然是 candidate 0，而不是 oracle best candidate；`best_of_k_missing_l1` 的收益还不能自动转化为 top-1 输出收益。
-- 候选平均质量仍需改善。`mean_k_missing_l1` 高于 candidate 0 和 best-of-K，说明部分随机候选仍偏弱，后续需要 candidate scorer、evidence gate 或更合理的 diversity/calibration 约束。
-
-因此，第6步的结论是：multi-candidate 训练方向成立，best-of-K 已经产生可观收益，completed mel 的测试质量可接受。可以进入第7步 Evidence-Aware Fusion Gate，但在论文叙事中应明确：第6步证明的是候选池 oracle 上限提升，第8步 candidate scorer 才负责把 oracle 候选收益转化为模型可用的 top-1 输出。
-
-另外，当前 checkpoint 记录中的 stage 仍显示为：
-
-```text
-EC-VIAI-AV-stage5-stochastic-adapter
-```
-
-但该 checkpoint 实际已经加入第6步 multi-candidate loss。后续建议更新 `_stage_name()` 或 checkpoint metadata，避免实验记录中 stage5/stage6 混淆。

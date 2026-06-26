@@ -55,6 +55,29 @@ def clamp01(value):
     return max(0.0, min(1.0, float(value)))
 
 
+def _normalize_instrument_name(name):
+    if name is None:
+        return None
+    return str(name).strip()
+
+
+def _score_for_target(record, target_instrument, missing_score):
+    target_instrument = _normalize_instrument_name(target_instrument)
+    if target_instrument:
+        probs_by_instrument = record.get("probs_by_instrument")
+        if isinstance(probs_by_instrument, dict):
+            if target_instrument in probs_by_instrument:
+                return clamp01(probs_by_instrument[target_instrument])
+            target_with_spaces = target_instrument.replace("_", " ")
+            if target_with_spaces in probs_by_instrument:
+                return clamp01(probs_by_instrument[target_with_spaces])
+            target_with_underscores = target_instrument.replace(" ", "_")
+            if target_with_underscores in probs_by_instrument:
+                return clamp01(probs_by_instrument[target_with_underscores])
+            return missing_score
+    return clamp01(record.get("semantic_score", missing_score))
+
+
 class SemanticEvidenceTable:
     def __init__(self, path=None, data_root=None, missing_score=0.0):
         self.data_root = data_root
@@ -95,14 +118,27 @@ class SemanticEvidenceTable:
                 return record
         return None
 
-    def lookup_score(self, path):
+    def lookup_score(self, path, target_instrument=None):
         record = self.lookup_record(path)
         if record is None:
             return self.missing_score
-        return clamp01(record.get("semantic_score", self.missing_score))
+        return _score_for_target(record, target_instrument, self.missing_score)
 
-    def lookup_scores(self, paths):
-        return [self.lookup_score(path) for path in paths]
+    def lookup_scores(self, paths, target_instruments=None):
+        paths = list(paths)
+        if target_instruments is None:
+            target_instruments = [None] * len(paths)
+        else:
+            target_instruments = list(target_instruments)
+            if len(target_instruments) != len(paths):
+                raise ValueError(
+                    "target_instruments length must match paths length; "
+                    f"got {len(target_instruments)} for {len(paths)} paths."
+                )
+        return [
+            self.lookup_score(path, target_instrument=target)
+            for path, target in zip(paths, target_instruments)
+        ]
 
 
 def semantic_scores_to_tensor(scores, reference):

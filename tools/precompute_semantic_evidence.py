@@ -167,17 +167,27 @@ def score_sample(
     top1_prob = float(avg_probs[top1_index].detach().cpu().item())
     target_rank = int((avg_probs > avg_probs[target_index]).sum().detach().cpu().item()) + 1
     frame_top1 = torch.argmax(probs, dim=1)
+    frame_top1_indices = frame_top1.detach().cpu().tolist()
     frame_consistency = float((frame_top1 == target_index).float().mean().detach().cpu().item())
+    avg_probs_cpu = avg_probs.detach().cpu().tolist()
+    probs_by_instrument = {
+        instrument_name: float(avg_probs_cpu[index])
+        for index, instrument_name in enumerate(instruments)
+    }
     sample_dir_out = relative_sample_dir(sample_dir, data_root=data_root) or sample_dir
     return {
         "sample_dir": sample_dir_out,
         "instrument": instrument,
         "semantic_score": target_prob,
         "target_prob": target_prob,
+        "probs_by_instrument": probs_by_instrument,
         "top1_instrument": instruments[top1_index],
         "top1_prob": top1_prob,
         "target_rank": target_rank,
         "frame_consistency": frame_consistency,
+        "frame_top1_instruments": [
+            instruments[index] for index in frame_top1_indices
+        ],
         "num_frames": len(frame_paths),
     }
 

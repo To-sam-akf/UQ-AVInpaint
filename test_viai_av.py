@@ -683,7 +683,10 @@ def apply_test_video_perturbation(model, wrong_video_sampler=None):
             model.video_batch,
             model.flow_batch,
         )
-        model.set_semantic_evidence_paths(wrong_video_sampler.last_wrong_dirs)
+        model.set_semantic_evidence_paths(
+            wrong_video_sampler.last_wrong_dirs,
+            target_instruments=wrong_video_sampler.last_source_instruments,
+        )
         return
     if mode == "no_video":
         model.video_batch = torch.zeros_like(model.video_batch)
@@ -761,6 +764,9 @@ def collect_per_sample_rows(
     )
 
     for index, sample_path in enumerate(model.path_batch):
+        semantic_target_instrument = ""
+        if index < len(getattr(model, "semantic_evidence_target_instruments", [])):
+            semantic_target_instrument = model.semantic_evidence_target_instruments[index] or ""
         row = {
             "sample_index": int(start_index + index),
             "sample_path": sample_path,
@@ -771,6 +777,7 @@ def collect_per_sample_rows(
             "evidence": float(evidence[index]),
             "heuristic_evidence": float(heuristic_evidence[index]),
             "semantic_evidence": float(semantic_evidence[index]),
+            "semantic_target_instrument": semantic_target_instrument,
             "gate": float(gate[index]),
             "sigma_scale": float(sigma_scale[index]),
             "top1_missing_l1": float(top1_error[index]),

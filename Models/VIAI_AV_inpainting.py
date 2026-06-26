@@ -336,6 +336,7 @@ class VIAIAVModel(object):
         self.mel_completed_candidates = torch.zeros_like(self.mel_candidates)
         self.mel_completed_pred = torch.zeros(1, 1, mel_height, mel_width, device=self.device)
         self.semantic_evidence_paths = []
+        self.semantic_evidence_target_instruments = []
         self.semantic_evidence_override = None
         self.loaded_stage = self._stage_name()
         setattr(self.hparams, "loaded_stage", self.loaded_stage)
@@ -492,8 +493,31 @@ class VIAIAVModel(object):
         self.missing_mask = self.missing_mask.to(self.device)
         self.visual_evidence_aug_mode = "none"
 
-    def set_semantic_evidence_paths(self, paths):
+    def _infer_semantic_targets(self, paths):
+        targets = []
+        for path in paths:
+            try:
+                targets.append(semantic_evidence.infer_instrument_from_sample_dir(path))
+            except ValueError:
+                targets.append(None)
+        return targets
+
+    def set_semantic_evidence_paths(self, paths, target_instruments=None):
         self.semantic_evidence_paths = list(paths)
+        if target_instruments is None:
+            self.semantic_evidence_target_instruments = self._infer_semantic_targets(
+                self.semantic_evidence_paths
+            )
+        else:
+            self.semantic_evidence_target_instruments = list(target_instruments)
+            if len(self.semantic_evidence_target_instruments) != len(
+                self.semantic_evidence_paths
+            ):
+                raise ValueError(
+                    "semantic target instrument count must match path count; "
+                    f"got {len(self.semantic_evidence_target_instruments)} targets "
+                    f"for {len(self.semantic_evidence_paths)} paths."
+                )
         self.semantic_evidence_override = None
 
     def set_semantic_evidence_override(self, value):
@@ -512,7 +536,8 @@ class VIAIAVModel(object):
                 scores = [float(override)] * batch_size
         else:
             scores = self.semantic_evidence_table.lookup_scores(
-                self.semantic_evidence_paths[:batch_size]
+                self.semantic_evidence_paths[:batch_size],
+                target_instruments=self.semantic_evidence_target_instruments[:batch_size],
             )
         if len(scores) != batch_size:
             raise ValueError(

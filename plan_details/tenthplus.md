@@ -89,3 +89,178 @@
 - 默认语义源：frozen CLIP 类模型，作为可选依赖和离线预计算工具，不进入主训练反向传播。
 - 当前环境依赖里没有 CLIP/open_clip，因此实现时应放到 optional dependency，不影响普通 VIAI-AV/EC-VIAI-AV 训练。
 - MUSICES sample path 可以从 `processed/<instrument>/...` 推断 instrument label。
+
+
+## 训练测试
+下面按“先不影响 Stage6，单独做 Stage10 语义旁路”的顺序来跑。
+
+**1. 安装可选 CLIP 依赖**
+```bash
+cd /home/sanmu/VIAIpro
+
+uv sync --extra semantic
+```
+
+云端如果不用 `uv`，可以：
+
+```bash
+python -m pip install open_clip_torch
+```
+
+**2. 设置路径**
+```bash
+export DATA_ROOT=/root/shared-nvme/data
+export REPO=/root/EC-ViAv-vgpu
+cd "$REPO"
+```
+
+**3. 先做小规模 semantic evidence smoke test**
+```bash
+uv run python tools/precompute_semantic_evidence.py \
+  --data-root "$DATA_ROOT" \
+  --split-name test_av_split.txt \
+  --limit 5 \
+  --num-frames 8 \
+  --batch-size 8
+```
+
+检查输出：
+
+```bash
+head -n 2 "$DATA_ROOT/semantic_evidence/clip_vit_b32/test_av_split.jsonl"
+```
+
+每行应该有：
+
+```text
+sample_dir, instrument, semantic_score, target_prob, top1_instrument, top1_prob, target_rank, frame_consistency, num_frames
+```
+
+**4. 正式预计算 train/val/test**
+```bash
+uv run python tools/precompute_semantic_evidence.py \
+  --data-root "$DATA_ROOT" \
+  --split-name train_av_split.txt \
+  --split-name val_av_split.txt \
+  --split-name test_av_split.txt \
+  --num-frames 8 \
+  --batch-size 32
+```
+
+输出路径：
+
+```bash
+$DATA_ROOT/semantic_evidence/clip_vit_b32/train_av_split.jsonl
+$DATA_ROOT/semantic_evidence/clip_vit_b32/val_av_split.jsonl
+$DATA_ROOT/semantic_evidence/clip_vit_b32/test_av_split.jsonl
+```
+
+**5. Stage10-B：先只测试，不训练**
+用已有 Stage8/full checkpoint 跑三种 evidence source 对比：
+
+```bash
+export STAGE8_CKPT=/path/to/EC-VIAI-AV-PatchGAN_checkpoint_stepXXXXXXXXX.pth.tar
+export TEST_ROOT=checkpoints/stage10_semantic_eval
+```
+
+```bash
+for SOURCE in heuristic semantic fused
+do
+  for MODE in none no_video wrong_video_cross_instrument
+  do
+    uv run python main.py test-viai-av -- \
+      --use_gan \
+      --lambda_gan 0.001 \
+      --enable_ec_viai_av \
+      --stochastic_adapter \
+      --enable_evidence_gate \
+      --freeze_gate_evidence_backbone \
+      --enable_evidence_scaled_sigma \
+      --enable_candidate_scorer \
+      --num_candidates 4 \
+      --test_num_candidates 4 \
+      --evidence_source "$SOURCE" \
+      --semantic_evidence_path "$DATA_ROOT/semantic_evidence/clip_vit_b32/test_av_split.jsonl" \
+      --semantic_evidence_weight 0.35 \
+      --resume_path "$STAGE8_CKPT" \
+      --data_root "$DATA_ROOT" \
+      --test_split_name test_av_split.txt \
+      --batch_size 1 \
+      --num_workers 0 \
+      --results_dir "$TEST_ROOT/$SOURCE/$MODE" \
+      --video_perturbation "$MODE" \
+      --display_id 0
+  done
+done
+```
+
+快速看结果：
+
+```bash
+find "$TEST_ROOT" -name "*_test.json" -print | sort | while read f
+do
+  uv run python - <<PY
+import json
+p="$f"
+d=json.load(open(p))
+print(
+    p,
+    "mode=", d.get("video_perturbation"),
+    "source=", d.get("evidence_source"),
+    "e=", round(d.get("evidence_mean", 0), 4),
+    "heur=", round(d.get("heuristic_evidence_mean", 0), 4),
+    "sem=", round(d.get("semantic_evidence_mean", 0), 4),
+    "gate=", round(d.get("gate_mean", 0), 4),
+    "u=", round(d.get("uncertainty_mean", 0), 4),
+    "top1=", round(d.get("top1_missing_l1", 0), 6),
+)
+PY
+done
+```
+
+**6. Stage10-C：正式训练 fused semantic evidence**
+从最佳 Stage8 checkpoint 开始：
+
+```bash
+export STAGE10_DIR=checkpoints/formal_ec_viai_av/stage10_semantic_fused
+
+uv run python main.py train-viai-av -- \
+  --use_gan \
+  --lambda_gan 0.001 \
+  --enable_ec_viai_av \
+  --stochastic_adapter \
+  --enable_evidence_gate \
+  --freeze_gate_evidence_backbone \
+  --enable_evidence_scaled_sigma \
+  --enable_candidate_scorer \
+  --num_candidates 4 \
+  --test_num_candidates 4 \
+  --lambda_min_k 1.0 \
+  --lambda_mean_k 0.1 \
+  --lambda_boundary 0.05 \
+  --lambda_diversity 0.05 \
+  --lambda_gate_evidence 0.1 \
+  --lambda_calib 0.1 \
+  --calib_error_tau 0.1 \
+  --evidence_source fused \
+  --semantic_evidence_path "$DATA_ROOT/semantic_evidence/clip_vit_b32/train_av_split.jsonl" \
+  --semantic_evidence_weight 0.35 \
+  --resume \
+  --resume_path "$STAGE8_CKPT" \
+  --reset_optimizer \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --checkpoint_dir "$STAGE10_DIR" \
+  --log_event_path "$STAGE10_DIR/events" \
+  --batch_size 4 \
+  --num_workers 4 \
+  --lr 0.00002 \
+  --max_train_steps 50000 \
+  --checkpoint_interval 5000 \
+  --print_freq 50 \
+  --display_id 0
+```
+
+**7. 注意**
+Stage6 正在跑的话，不要改它的命令；Stage10 是从 Stage8/full checkpoint 之后单独开新实验。测试时用 `test_av_split.jsonl`，训练时用 `train_av_split.jsonl`。

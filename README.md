@@ -557,6 +557,7 @@ rsync -avz --progress \
 ```
 rsync -avz --progress \
   --exclude='.git/' \
+  --exclude='checkpoints/' \
   --exclude='.venv/' \
   --exclude='data/' \
   --exclude='__pycache__/' \
@@ -573,6 +574,7 @@ rsync -avz --progress \
   ~/VIAIpro/ \
   root@ackcs-00gjh78a@ssh.bj8.bz1.paratera.com:/root/EC-ViAv-vgpu/
 ```
+
 
 ## 9.下载到本地
 ```
