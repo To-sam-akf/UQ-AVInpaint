@@ -387,6 +387,8 @@ class BaseOptions(object):
             "flow_25",
             "flow_zero",
             "static_video_zero_flow",
+            "no_video",
+            "wrong_video_cross_instrument",
         }
         visual_aug_modes = [
             mode.strip()

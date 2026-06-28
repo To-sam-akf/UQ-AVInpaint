@@ -14,6 +14,7 @@ from networks import Inpainting_Networks
 from networks import New_Inpainting_Networks
 from utils import semantic_evidence
 from utils import util
+from utils.wrong_video_sampler import WrongVideoSampler
 
 
 def _copy_matching_state(module, source_state, label):
@@ -101,6 +102,17 @@ class VIAIAVModel(object):
                 )
             )
         )
+        self.train_wrong_video_sampler = None
+        if (
+            self.enable_visual_evidence_aug
+            and "wrong_video_cross_instrument" in self.visual_evidence_aug_modes
+        ):
+            self.train_wrong_video_sampler = WrongVideoSampler(
+                hparams,
+                split_name=getattr(hparams, "train_split_name", "train_av_split.txt"),
+                mode="wrong_video_cross_instrument",
+                train=True,
+            )
         if self.use_deterministic_adapter and self.use_stochastic_adapter:
             raise ValueError(
                 "--stochastic_adapter and --deterministic_adapter cannot both be enabled."
@@ -286,6 +298,8 @@ class VIAIAVModel(object):
             "flow_25": 0.0,
             "flow_zero": 0.0,
             "static_video_zero_flow": 0.0,
+            "no_video": 0.0,
+            "wrong_video_cross_instrument": 0.0,
         }
         self.audio_prior_feature = torch.zeros(1, 256, 1, 1, device=self.device)
         self.calibrated_video_feature = torch.zeros(1, 256, 1, 1, device=self.device)
@@ -565,6 +579,8 @@ class VIAIAVModel(object):
             "flow_25": 0.0,
             "flow_zero": 0.0,
             "static_video_zero_flow": 0.0,
+            "no_video": 0.0,
+            "wrong_video_cross_instrument": 0.0,
         }
         self.visual_evidence_aug_mode_items[mode] = 1.0
         self.visual_evidence_aug_applied_item = 0.0 if mode == "none" else 1.0
@@ -577,6 +593,35 @@ class VIAIAVModel(object):
         if random.random() >= prob:
             return
         mode = random.choice(self.visual_evidence_aug_modes)
+        if mode == "no_video":
+            self.video_batch = torch.zeros_like(self.video_batch)
+            self.flow_batch = torch.zeros_like(self.flow_batch)
+            self.set_semantic_evidence_override(0.0)
+            self._set_visual_evidence_aug_mode(mode)
+            return
+        if mode == "wrong_video_cross_instrument":
+            if self.train_wrong_video_sampler is None:
+                self.train_wrong_video_sampler = WrongVideoSampler(
+                    self.hparams,
+                    split_name=getattr(
+                        self.hparams,
+                        "train_split_name",
+                        "train_av_split.txt",
+                    ),
+                    mode="wrong_video_cross_instrument",
+                    train=True,
+                )
+            self.video_batch, self.flow_batch = self.train_wrong_video_sampler.load_batch(
+                self.path_batch,
+                self.video_batch,
+                self.flow_batch,
+            )
+            self.set_semantic_evidence_paths(
+                self.train_wrong_video_sampler.last_wrong_dirs,
+                target_instruments=self.train_wrong_video_sampler.last_source_instruments,
+            )
+            self._set_visual_evidence_aug_mode(mode)
+            return
         self.video_batch, self.flow_batch = EC_VIAI_Modules.apply_visual_evidence_augmentation(
             self.video_batch,
             self.flow_batch,

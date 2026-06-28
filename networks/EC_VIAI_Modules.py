@@ -9,6 +9,8 @@ VISUAL_EVIDENCE_AUG_MODES = (
     "flow_25",
     "flow_zero",
     "static_video_zero_flow",
+    "no_video",
+    "wrong_video_cross_instrument",
 )
 
 
@@ -40,6 +42,13 @@ def apply_visual_evidence_augmentation(video_batch, flow_batch, mode):
     if mode == "static_video_zero_flow":
         static_video = video_batch[:, :1].expand_as(video_batch).contiguous()
         return static_video, torch.zeros_like(flow_batch)
+    if mode == "no_video":
+        return torch.zeros_like(video_batch), torch.zeros_like(flow_batch)
+    if mode == "wrong_video_cross_instrument":
+        raise ValueError(
+            "wrong_video_cross_instrument augmentation requires a WrongVideoSampler; "
+            "apply it through VIAIAVModel._maybe_apply_visual_evidence_aug."
+        )
     raise ValueError(
         f"Unknown visual evidence augmentation mode: {mode}. "
         f"Supported modes: {', '.join(VISUAL_EVIDENCE_AUG_MODES)}"

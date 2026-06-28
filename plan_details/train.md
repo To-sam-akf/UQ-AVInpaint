@@ -1517,15 +1517,328 @@ python main.py train-viai-av -- \
 4. 再做 Stage10-C fused 正式训练  
 5. 最后跑四种 perturbation 测试
 
-**0. 环境变量**
+## stage10 D semantic_perturbation_training
+
+`tests/test_stage10d_semantic_perturbation.py` 是 **pytest 单元测试**，不是可执行的命令行脚本。它包含 3 个测试：
+
+| 测试函数 | 验证内容 |
+|:---|---|
+| `test_visual_evidence_aug_modes_accept_stage10d_modes` | augmentation modes 能正确解析 `wrong_video_cross_instrument,no_video,flow_zero` |
+| `test_no_video_visual_evidence_aug_zeros_video_and_flow` | no_video 扰动后 video/flow 全零 |
+| `test_train_wrong_video_sampler_picks_cross_instrument_sample` | train-time wrong-video sampler 能为 cello sample 找到 flute 的 wrong video |
+
+运行方式：
+
+```bash
+cd ~/EC-ViAv-vgpu
+python -m pytest tests/test_stage10d_semantic_perturbation.py -v
+```
+
+---
+### 训练到95000
+
+**实际的 Stage10-D 训练命令**（来自 `stageDSemantic_perturbationtrain.md` 第53-65行）：
+
+```bash
+export DATA_ROOT=/root/shared-nvme/data
+export STAGE8_CKPT=checkpoints/formal_ec_viai_av/stage8_candidate_scorer_uncertainty/EC-VIAI-AV-PatchGAN_checkpoint_step000090000.pth.tar
+export TRAIN_SEM=$DATA_ROOT/semantic_evidence/clip_vit_b32/train_av_split.jsonl
+export STAGE10D_DIR=checkpoints/formal_ec_viai_av/stage10d_semantic_perturb_fused_corrected
+
+python main.py train-viai-av -- \
+  --use_gan \
+  --lambda_gan 0.001 \
+  --enable_ec_viai_av \
+  --stochastic_adapter \
+  --enable_evidence_gate \
+  --freeze_gate_evidence_backbone \
+  --enable_evidence_scaled_sigma \
+  --enable_candidate_scorer \
+  --evidence_source fused \
+  --semantic_evidence_path "$TRAIN_SEM" \
+  --semantic_evidence_weight 0.35 \
+  --enable_visual_evidence_aug \
+  --visual_evidence_aug_prob 0.35 \
+  --visual_evidence_aug_modes wrong_video_cross_instrument,no_video,flow_zero \
+  --evidence_sigma_scale_min 0.5 \
+  --evidence_sigma_scale_max 2.0 \
+  --sigma_max 2.0 \
+  --num_candidates 4 \
+  --test_num_candidates 4 \
+  --lambda_min_k 1.0 \
+  --lambda_mean_k 0.1 \
+  --lambda_boundary 0.05 \
+  --lambda_diversity 0.05 \
+  --lambda_gate_evidence 0.2 \
+  --lambda_calib 0.05 \
+  --calib_error_tau 0.1 \
+  --resume \
+  --resume_path "$STAGE8_CKPT" \
+  --reset_optimizer \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --checkpoint_dir "$STAGE10D_DIR" \
+  --log_event_path "$STAGE10D_DIR/events" \
+  --batch_size 2 \
+  --num_workers 4 \
+  --lr 0.00002 \
+  --max_train_steps 95000 \
+  --checkpoint_interval 5000 \
+  --print_freq 50 \
+  --display_id 0
+```
+
+启动日志必须看到：
+
+```text
+enable_visual_evidence_aug=True
+visual_evidence_aug_prob=0.35
+visual_evidence_aug_modes=wrong_video_cross_instrument,no_video,flow_zero
+lambda_gate_evidence=0.2
+```
+
+**训练完成后测试命令**（四种扰动）：
+
+```bash
+export STAGE10D_CKPT=/root/EC-ViAv-vgpu/checkpoints/formal_ec_viai_av/stage10d_semantic_perturb_fused_corrected/EC-VIAI-AV-PatchGAN_checkpoint_step000095000.pth.tar
+
+export TEST_SEM=$DATA_ROOT/semantic_evidence/clip_vit_b32/test_av_split.jsonl
+export TEST_ROOT=checkpoints/stage10d_eval_95000
+
+for MODE in none flow_zero no_video wrong_video_cross_instrument
+do
+  python test_viai_av.py \
+    --use_gan \
+    --lambda_gan 0.001 \
+    --enable_ec_viai_av \
+    --stochastic_adapter \
+    --enable_evidence_gate \
+    --freeze_gate_evidence_backbone \
+    --enable_evidence_scaled_sigma \
+    --enable_candidate_scorer \
+    --evidence_source fused \
+    --semantic_evidence_path "$TEST_SEM" \
+    --semantic_evidence_weight 0.35 \
+    --evidence_sigma_scale_min 0.5 \
+    --evidence_sigma_scale_max 2.0 \
+    --sigma_max 2.0 \
+    --num_candidates 4 \
+    --test_num_candidates 4 \
+    --lambda_min_k 1.0 \
+    --lambda_mean_k 0.1 \
+    --lambda_boundary 0.05 \
+    --lambda_diversity 0.05 \
+    --lambda_gate_evidence 0.2 \
+    --lambda_calib 0.05 \
+    --calib_error_tau 0.1 \
+    --resume_path "$STAGE10D_CKPT" \
+    --data_root "$DATA_ROOT" \
+    --test_split_name test_av_split.txt \
+    --batch_size 1 \
+    --num_workers 0 \
+    --results_dir "$TEST_ROOT/$MODE" \
+    --video_perturbation "$MODE" \
+    --calibration_bins 10 \
+    --display_id 0
+done
+```
+### 训练到10000step
+下面给你 **Stage10-D 从 95000 继续到 100000** 的训练和测试命令。注意：从 **Stage10-D-95000** 继续，不要从失败的 Stage10-95000 继续。
+
+**1. 设置环境变量**
 
 ```bash
 cd ~/EC-ViAv-vgpu
 
-export DATA_ROOT=下面是一套 **Stage10 semantic evidence** 的完整操作。建议顺序是：
+export DATA_ROOT=/root/shared-nvme/data
+export SEM_DIR=$DATA_ROOT/semantic_evidence/clip_vit_b32
+export TRAIN_SEM=$SEM_DIR/train_av_split.jsonl
+export TEST_SEM=$SEM_DIR/test_av_split.jsonl
 
-1. 安装 optional CLIP 依赖  
-2. 离线预计算 semantic JSONL  
-3. 先做 Stage10-B 只读验证  
-4. 再做 Stage10-C fused 正式训练  
-5. 最后跑四种 perturbation 测试
+export STAGE10D_DIR=checkpoints/formal_ec_viai_av/stage10d_semantic_perturb_fused_corrected
+export STAGE10D_95000_CKPT=$STAGE10D_DIR/EC-VIAI-AV-PatchGAN_checkpoint_step000095000.pth.tar
+```
+
+确认：
+
+```bash
+ls -lh "$STAGE10D_95000_CKPT"
+ls -lh "$TRAIN_SEM" "$TEST_SEM"
+```
+
+**2. 从 95000 继续训练到 100000**
+
+```bash
+python main.py train-viai-av -- \
+  --use_gan \
+  --lambda_gan 0.001 \
+  --enable_ec_viai_av \
+  --stochastic_adapter \
+  --enable_evidence_gate \
+  --freeze_gate_evidence_backbone \
+  --enable_evidence_scaled_sigma \
+  --enable_candidate_scorer \
+  --evidence_source fused \
+  --semantic_evidence_path "$TRAIN_SEM" \
+  --semantic_evidence_weight 0.35 \
+  --semantic_missing_score 0.0 \
+  --enable_visual_evidence_aug \
+  --visual_evidence_aug_prob 0.35 \
+  --visual_evidence_aug_modes wrong_video_cross_instrument,no_video,flow_zero \
+  --evidence_sigma_scale_min 0.5 \
+  --evidence_sigma_scale_max 2.0 \
+  --sigma_max 2.0 \
+  --num_candidates 4 \
+  --test_num_candidates 4 \
+  --lambda_min_k 1.0 \
+  --lambda_mean_k 0.1 \
+  --lambda_boundary 0.05 \
+  --lambda_diversity 0.05 \
+  --lambda_gate_evidence 0.2 \
+  --lambda_calib 0.05 \
+  --calib_error_tau 0.1 \
+  --resume \
+  --resume_path "$STAGE10D_95000_CKPT" \
+  --data_root "$DATA_ROOT" \
+  --train_split_name train_av_split.txt \
+  --val_split_name val_av_split.txt \
+  --checkpoint_dir "$STAGE10D_DIR" \
+  --log_event_path "$STAGE10D_DIR/events" \
+  --batch_size 2 \
+  --num_workers 4 \
+  --lr 0.00002 \
+  --max_train_steps 100000 \
+  --checkpoint_interval 5000 \
+  --print_freq 50 \
+  --display_id 0
+```
+
+启动日志里确认：
+
+```text
+resume_path=...step000095000.pth.tar
+enable_visual_evidence_aug=True
+visual_evidence_aug_prob=0.35
+visual_evidence_aug_modes=wrong_video_cross_instrument,no_video,flow_zero
+lambda_gate_evidence=0.2
+evidence_source=fused
+semantic_evidence_path=...train_av_split.jsonl
+```
+
+**3. 测试 100000**
+
+```bash
+export STAGE10D_100000_CKPT=$STAGE10D_DIR/EC-VIAI-AV-PatchGAN_checkpoint_step000100000.pth.tar
+export TEST_ROOT=checkpoints/stage10d_eval_100000_perturbation
+```
+
+确认：
+
+```bash
+ls -lh "$STAGE10D_100000_CKPT"
+```
+
+跑四组：
+
+```bash
+for MODE in none flow_zero no_video wrong_video_cross_instrument
+do
+  python test_viai_av.py \
+    --use_gan \
+    --lambda_gan 0.001 \
+    --enable_ec_viai_av \
+    --stochastic_adapter \
+    --enable_evidence_gate \
+    --freeze_gate_evidence_backbone \
+    --enable_evidence_scaled_sigma \
+    --enable_candidate_scorer \
+    --evidence_source fused \
+    --semantic_evidence_path "$TEST_SEM" \
+    --semantic_evidence_weight 0.35 \
+    --semantic_missing_score 0.0 \
+    --evidence_sigma_scale_min 0.5 \
+    --evidence_sigma_scale_max 2.0 \
+    --sigma_max 2.0 \
+    --num_candidates 4 \
+    --test_num_candidates 4 \
+    --lambda_min_k 1.0 \
+    --lambda_mean_k 0.1 \
+    --lambda_boundary 0.05 \
+    --lambda_diversity 0.05 \
+    --lambda_gate_evidence 0.2 \
+    --lambda_calib 0.05 \
+    --calib_error_tau 0.1 \
+    --resume_path "$STAGE10D_100000_CKPT" \
+    --data_root "$DATA_ROOT" \
+    --test_split_name test_av_split.txt \
+    --batch_size 1 \
+    --num_workers 0 \
+    --results_dir "$TEST_ROOT/$MODE" \
+    --video_perturbation "$MODE" \
+    --calibration_bins 10 \
+    --display_id 0
+done
+```
+
+**4. 汇总测试结果**
+
+```bash
+python - <<'PY'
+import json, glob, os
+
+root = os.environ["TEST_ROOT"]
+modes = ["none", "flow_zero", "no_video", "wrong_video_cross_instrument"]
+fields = [
+    "top1_missing_l1",
+    "best_of_k_missing_l1",
+    "evidence_mean",
+    "heuristic_evidence_mean",
+    "semantic_evidence_mean",
+    "gate_mean",
+    "gate_target_mean",
+    "gate_target_gap",
+    "uncertainty_mean",
+    "uncertainty_error_spearman",
+    "psnr_missing",
+]
+
+print("mode," + ",".join(fields))
+for mode in modes:
+    p = glob.glob(f"{root}/{mode}/*_test.json")[0]
+    d = json.load(open(p))
+    vals = []
+    for f in fields:
+        v = d.get(f, "")
+        vals.append(f"{v:.6f}" if isinstance(v, float) else str(v))
+    print(mode + "," + ",".join(vals))
+PY
+```
+
+**5. 再跑 wrong-video semantic 诊断**
+
+```bash
+python tools/diagnose_semantic_evidence.py \
+  --semantic-jsonl "$TEST_SEM" \
+  --sample-metrics-csv "$TEST_ROOT/wrong_video_cross_instrument/sample-metrics/step000100000_perturb-wrong_video_cross_instrument_samples.csv"
+```
+
+**6. 选择 95000 还是 100000**
+
+选 `100000` 的条件：
+
+```text
+none top1_missing_l1 <= 0.0610
+wrong_video gate_mean < 0.55
+no_video gate_mean <= 0.153 或接近
+wrong_video uncertainty_mean > none uncertainty_mean
+wrong_video semantic_evidence_mean ≈ 0.052
+```
+
+否则回退用 `95000`：
+
+```text
+none top1 = 0.060798
+wrong_video gate = 0.566
+no_video gate = 0.153
+```

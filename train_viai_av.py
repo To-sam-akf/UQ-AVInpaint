@@ -277,6 +277,8 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         "visual_evidence_aug_flow_25": 0.0,
         "visual_evidence_aug_flow_zero": 0.0,
         "visual_evidence_aug_static_video_zero_flow": 0.0,
+        "visual_evidence_aug_no_video": 0.0,
+        "visual_evidence_aug_wrong_video_cross_instrument": 0.0,
         "loss_d": 0.0,
         "psnr_full": 0.0,
         "psnr_missing": 0.0,
@@ -526,6 +528,10 @@ def run_phase(model, data_loader, phase, global_step, writer, global_epoch):
         "visual_evidence_aug_flow_zero": totals["visual_evidence_aug_flow_zero"] / batch_count,
         "visual_evidence_aug_static_video_zero_flow": (
             totals["visual_evidence_aug_static_video_zero_flow"] / batch_count
+        ),
+        "visual_evidence_aug_no_video": totals["visual_evidence_aug_no_video"] / batch_count,
+        "visual_evidence_aug_wrong_video_cross_instrument": (
+            totals["visual_evidence_aug_wrong_video_cross_instrument"] / batch_count
         ),
         "loss_d": totals["loss_d"] / batch_count,
         "psnr_full": totals["psnr_full"] / max(1, sample_count),
