@@ -164,6 +164,9 @@ RESULT_FIELDS = [
     "retrieval_video_to_audio_meanr",
     "use_vocoder",
     "vocoder_backend",
+    "vocoder_checkpoint",
+    "vocoder_splice_missing",
+    "vocoder_crossfade_ms",
     "vocoder_n_iter",
     "vocoder_output_dir",
     "vocoder_num_samples",
@@ -710,6 +713,9 @@ def save_candidate_vocoder_batches(output_dir, start_index, model, max_items=Non
             hparams,
             backend=getattr(hparams, "vocoder_backend", "griffin_lim"),
             n_iter=getattr(hparams, "vocoder_n_iter", 32),
+            checkpoint_path=getattr(hparams, "vocoder_checkpoint", None),
+            splice_missing=getattr(hparams, "vocoder_splice_missing", True),
+            crossfade_ms=getattr(hparams, "vocoder_crossfade_ms", 20.0),
             max_items=batch_size,
         )
     return batch_size
@@ -953,6 +959,9 @@ def evaluate(
                     hparams,
                     backend=getattr(hparams, "vocoder_backend", "griffin_lim"),
                     n_iter=getattr(hparams, "vocoder_n_iter", 32),
+                    checkpoint_path=getattr(hparams, "vocoder_checkpoint", None),
+                    splice_missing=getattr(hparams, "vocoder_splice_missing", True),
+                    crossfade_ms=getattr(hparams, "vocoder_crossfade_ms", 20.0),
                     max_items=remaining,
                 )
                 vocoder_count += len(written)
@@ -1328,6 +1337,9 @@ def build_result_record(checkpoint_path, checkpoint_step_value, global_step, glo
         "retrieval_video_to_audio_meanr": float(video_to_audio[5]),
         "use_vocoder": bool(getattr(hparams, "use_vocoder", False)),
         "vocoder_backend": getattr(hparams, "vocoder_backend", "griffin_lim"),
+        "vocoder_checkpoint": getattr(hparams, "vocoder_checkpoint", "") or "",
+        "vocoder_splice_missing": bool(getattr(hparams, "vocoder_splice_missing", True)),
+        "vocoder_crossfade_ms": float(getattr(hparams, "vocoder_crossfade_ms", 20.0)),
         "vocoder_n_iter": int(getattr(hparams, "vocoder_n_iter", 32)),
         "vocoder_output_dir": results.get("vocoder_output_dir", ""),
         "vocoder_num_samples": int(results.get("vocoder_num_samples", 0)),

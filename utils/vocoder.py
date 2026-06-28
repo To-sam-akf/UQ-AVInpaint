@@ -4,6 +4,15 @@ import re
 import librosa
 import numpy as np
 from scipy.io import wavfile
+import torch
+
+from utils.hifigan import (
+    HifiGanGenerator,
+    get_hifigan_config,
+    infer_hifigan_waveform,
+    load_matching_generator_checkpoint,
+    splice_missing_audio,
+)
 
 
 def _as_numpy(array):
@@ -82,8 +91,32 @@ def peak_normalize(wav, peak=0.99):
     return np.clip(wav, -float(peak), float(peak)).astype(np.float32)
 
 
-def mel_to_waveform(mel, hparams, backend="griffin_lim", n_iter=32):
+_HIFIGAN_CACHE = {}
+
+
+def _load_hifigan_generator(hparams, checkpoint_path):
+    if not checkpoint_path:
+        raise ValueError("--vocoder_checkpoint is required when --vocoder_backend hifigan.")
+    device = torch.device("cuda" if torch.cuda.is_available() and bool(getattr(hparams, "cuda_on", True)) else "cpu")
+    key = (os.path.abspath(checkpoint_path), str(device))
+    if key in _HIFIGAN_CACHE:
+        return _HIFIGAN_CACHE[key], device
+    config = get_hifigan_config(hparams)
+    generator = HifiGanGenerator(config).to(device)
+    load_matching_generator_checkpoint(checkpoint_path, generator, device=device)
+    generator.eval()
+    _HIFIGAN_CACHE[key] = generator
+    return generator, device
+
+
+def mel_to_waveform(mel, hparams, backend="griffin_lim", n_iter=32, checkpoint_path=None):
     backend = str(backend).lower()
+    if backend in {"hifigan", "hifi-gan"}:
+        generator, device = _load_hifigan_generator(hparams, checkpoint_path)
+        wav = infer_hifigan_waveform(generator, mel, hparams, device=device)
+        wav = np.asarray(wav, dtype=np.float32).reshape(-1)
+        hop_size = int(getattr(hparams, "hop_size", 320))
+        return _fix_waveform_length(wav, _as_bct(mel).shape[-1] * hop_size)
     if backend not in {"griffin_lim", "griffin-lim", "griffinlim"}:
         raise ValueError(f"Unsupported vocoder backend: {backend}")
 
@@ -104,7 +137,9 @@ def mel_to_waveform(mel, hparams, backend="griffin_lim", n_iter=32):
         fmax=fmax,
         power=1.0,
         n_iter=int(n_iter),
-        center=False,
+        # Match tools.prepare_musices.compute_mel_spectrogram(), where
+        # librosa.stft() uses center=True by default.
+        center=True,
         dtype=np.float32,
     )
     return _fix_waveform_length(wav, mel_amp.shape[1] * hop_size)
@@ -132,6 +167,9 @@ def save_vocoder_batch(
     backend="griffin_lim",
     n_iter=32,
     max_items=None,
+    checkpoint_path=None,
+    splice_missing=True,
+    crossfade_ms=20.0,
 ):
     os.makedirs(output_dir, exist_ok=True)
     mel_input = np.clip(_as_bct(mel_input), 0.0, 1.0)
@@ -154,7 +192,21 @@ def save_vocoder_batch(
             hparams,
             backend=backend,
             n_iter=n_iter,
+            checkpoint_path=checkpoint_path,
         )
+        if (
+            str(backend).lower() in {"hifigan", "hifi-gan"}
+            and bool(splice_missing)
+            and target_audio is not None
+            and index < target_audio.shape[0]
+        ):
+            reconstructed_wav = splice_missing_audio(
+                target_audio[index],
+                reconstructed_wav,
+                missing_mask[index],
+                hparams,
+                crossfade_ms=crossfade_ms,
+            )
 
         reconstructed_path = os.path.join(output_dir, f"{stem}_reconstructed.wav")
         target_path = os.path.join(output_dir, f"{stem}_target.wav")

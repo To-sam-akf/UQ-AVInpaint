@@ -14,6 +14,7 @@ MODULE_MAP = {
     "test-viai-a": "test_viai_a",
     "train-viai-av": "train_viai_av",
     "test-viai-av": "test_viai_av",
+    "train-vocoder": "train_vocoder",
 }
 
 

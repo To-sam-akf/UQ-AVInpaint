@@ -256,9 +256,13 @@ class BaseOptions(object):
             "--vocoder_backend",
             type=str,
             default="griffin_lim",
-            choices=["griffin_lim"],
-            help="Mel-to-waveform backend. Current route B implementation uses Griffin-Lim.",
+            choices=["griffin_lim", "hifigan"],
+            help="Mel-to-waveform backend.",
         )
+        self.parser.add_argument("--vocoder_checkpoint", type=str, default=None)
+        self.parser.add_argument("--vocoder_splice_missing", action="store_true", default=True)
+        self.parser.add_argument("--no_vocoder_splice_missing", dest="vocoder_splice_missing", action="store_false")
+        self.parser.add_argument("--vocoder_crossfade_ms", type=float, default=20.0)
         self.parser.add_argument(
             "--vocoder_n_iter",
             type=int,
@@ -277,6 +281,13 @@ class BaseOptions(object):
             default=None,
             help="Optional wav output directory. Defaults to <results_dir>/wav/stepXXXXXXXXX.",
         )
+        self.parser.add_argument("--vocoder_model", type=str, default="hifigan", choices=["hifigan"])
+        self.parser.add_argument("--hifigan_pretrained_generator", type=str, default=None)
+        self.parser.add_argument("--hifigan_segment_mel_frames", type=int, default=32)
+        self.parser.add_argument("--hifigan_mel_loss_weight", type=float, default=45.0)
+        self.parser.add_argument("--hifigan_feature_loss_weight", type=float, default=2.0)
+        self.parser.add_argument("--hifigan_eval_samples", type=int, default=2)
+        self.parser.add_argument("--max_steps", type=int, default=None)
 
         # Visual stream and fusion encoder
         self.parser.add_argument("--feature_length", type=int, default=256)
@@ -417,6 +428,18 @@ class BaseOptions(object):
             self.parser.error(
                 "--stochastic_adapter and --deterministic_adapter cannot both be enabled."
             )
+        if opt.use_vocoder and opt.vocoder_backend == "hifigan" and not opt.vocoder_checkpoint:
+            self.parser.error("--vocoder_backend hifigan requires --vocoder_checkpoint.")
+        if opt.vocoder_crossfade_ms < 0:
+            self.parser.error("--vocoder_crossfade_ms must be >= 0.")
+        if opt.hifigan_segment_mel_frames < 1:
+            self.parser.error("--hifigan_segment_mel_frames must be >= 1.")
+        if opt.hifigan_mel_loss_weight < 0:
+            self.parser.error("--hifigan_mel_loss_weight must be >= 0.")
+        if opt.hifigan_feature_loss_weight < 0:
+            self.parser.error("--hifigan_feature_loss_weight must be >= 0.")
+        if opt.max_steps is not None and opt.max_steps < 1:
+            self.parser.error("--max_steps must be >= 1.")
 
         if opt.beta_recon is None:
             opt.beta_recon = opt.lambda_recon
